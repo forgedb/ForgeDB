@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ForgeError;
 
-/// Localhost on port 5826 (hex for "FB"). Chosen to avoid the Postgres 5432 clash.
+/// Localhost on port 5826 (hex for "FB").
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:5826";
 
 /// Runtime configuration for a ForgeDB instance.

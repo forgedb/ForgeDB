@@ -56,13 +56,28 @@ pub fn app(state: AppState) -> Router {
 }
 
 /// GET /v1/:collection
-/// Lists all documents in a collection.
+/// Lists all documents in a collection as JSON objects.
+///
+/// Each stored MessagePack payload is transcoded to JSON on the fly.
+/// Yeah, it's a full scan — pagination and cursors come in v0.3.
 async fn list_docs(
     State(state): State<AppState>,
     Path(collection): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
     match state.engine.list(&collection) {
-        Ok(docs) => Ok(Json(docs)),
+        Ok(docs) => {
+            // Trancscode each MessagePack payload into a JSON value so we can
+            // send back a sane JSON array to the client.
+            let json_docs: Vec<serde_json::Value> = docs
+                .into_iter()
+                .map(|(id, bytes)| {
+                    let doc: serde_json::Value =
+                        rmp_serde::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                    serde_json::json!({ "id": id, "doc": doc })
+                })
+                .collect();
+            Ok(Json(json_docs))
+        }
         Err(e) => {
             tracing::error!("list failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
