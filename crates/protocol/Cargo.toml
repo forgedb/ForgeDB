@@ -8,3 +8,8 @@ description = "TLS-mandatory network listener for ForgeDB"
 
 [dependencies]
 forge-types = { workspace = true }
+forge-security = { workspace = true }
+rustls = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
