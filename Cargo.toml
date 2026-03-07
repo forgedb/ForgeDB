@@ -32,7 +32,7 @@ rcgen = "0.13"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 tempfile = "3"
 
 # Internal crate references

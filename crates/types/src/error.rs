@@ -48,6 +48,18 @@ pub enum ForgeError {
     /// Self-signed certificate generation failure.
     #[error("certificate generation error: {0}")]
     CertGen(String),
+
+    /// Missing, malformed, or tampered PASETO token.
+    #[error("auth error: {0}")]
+    Auth(String),
+
+    /// Missing or explicitly denied Cedar policy access.
+    #[error("policy error: {0}")]
+    Policy(String),
+
+    /// Audit log violations (e.g., attempt to overwrite an existing entry).
+    #[error("audit error: {0}")]
+    Audit(String),
 }
 
 #[cfg(test)]

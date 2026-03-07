@@ -8,3 +8,9 @@ description = "Encrypted storage engine backed by redbx for ForgeDB"
 
 [dependencies]
 forge-types = { workspace = true }
+redbx = { workspace = true }
+uuid = { workspace = true }
+rmp-serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
