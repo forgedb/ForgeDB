@@ -9,6 +9,8 @@ description = "PASETO v4 authentication for ForgeDB (planned for v0.2+)"
 [dependencies]
 forge-types = { workspace = true }
 pasetors = { workspace = true }
+axum = "0.8"
+tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

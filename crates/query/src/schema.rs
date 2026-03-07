@@ -81,11 +81,8 @@ mod tests {
 
     #[test]
     fn schema_compiles_successfully() {
-        // Calling this shouldn't error. If we somehow broke the JSON structure above,
-        // this test catches it instantly.
         let schema = forge_schema().expect("hardcoded schema must be entirely valid");
 
-        // Let's at least assert it has the namespace we expect.
         let ns = schema
             .action_entities()
             .expect("should have at least some actions defined");

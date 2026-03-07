@@ -9,7 +9,6 @@ use pasetors::version4::V4;
 use std::sync::Arc;
 
 pub mod audit;
-pub mod auth;
 pub mod policy;
 
 use axum::{
@@ -50,8 +49,8 @@ pub fn app(state: AppState) -> Router {
             audit::audit_logger,
         ))
         .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_auth,
+            state.public_key.clone(),
+            forge_auth::middleware::require_auth,
         ))
         .with_state(state)
 }
