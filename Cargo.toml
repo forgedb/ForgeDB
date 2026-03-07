@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/security",
+    "crates/storage",
+    "crates/protocol",
+    "crates/query",
+    "crates/auth",
+    "crates/server",
+    "crates/cli",
+    "crates/bin",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/forgedb/forgedb"
+
+[workspace.dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+toml = "0.8"
+redbx = "3"
+aws-lc-rs = "1"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "std"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["full"] }
+rcgen = "0.13"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
+# Internal crate references
+forge-types = { path = "crates/types" }
+forge-security = { path = "crates/security" }
+forge-storage = { path = "crates/storage" }
+forge-protocol = { path = "crates/protocol" }
+forge-query = { path = "crates/query" }
+forge-auth = { path = "crates/auth" }
+forge-server = { path = "crates/server" }
+forge-cli = { path = "crates/cli" }
