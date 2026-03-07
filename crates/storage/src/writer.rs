@@ -1,7 +1,7 @@
 //! Async write-coalescing channel — the fix for the "35 docs/sec per-call" problem.
 //!
 //! Every `POST /v1/:collection` call currently commits its own transaction, meaning
-//! one fsync per document. On a MacBook that's ~28 ms/doc, or roughly 35 docs/sec.
+//! one fsync per document.
 //! Under concurrency, though, we can do much better: collect writes that arrive within
 //! a short window and flush them in a single transaction.
 //!
@@ -144,10 +144,7 @@ async fn batcher_loop(engine: Arc<StorageEngine>, mut rx: mpsc::Receiver<WriteRe
             let reply_result: forge_types::Result<()> = match &stringified {
                 Ok(()) => Ok(()),
                 Err(msg) => Err(forge_types::ForgeError::Storage(redbx::Error::from(
-                    redbx::StorageError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        msg.clone(),
-                    )),
+                    redbx::StorageError::Io(std::io::Error::other(msg.clone())),
                 ))),
             };
             let _ = req.reply.send(reply_result);

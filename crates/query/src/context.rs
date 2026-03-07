@@ -62,8 +62,6 @@ impl AuthContext {
             .parse()
             .map_err(|e| ForgeError::Policy(format!("invalid resource UID: {e}")))?;
 
-        // No extra context yet (like IP address, location, or time of day).
-        // Honestly, we probably don't need it right now.
         let context = Context::empty();
 
         Request::new(
@@ -101,9 +99,6 @@ mod tests {
     }
 
     #[test]
-    // Note: We don't really have a clean way to force EntityUid parse failures
-    // easily without generating totally malicious garbage strings that break Cedar's
-    // parser (which would just be testing Cedar itself), but we know it handles normal email strings fine.
     fn context_handles_complex_strings() {
         let ctx = AuthContext::new("user_name@domain.com", "Write", "a/b/c/d");
         let req = ctx.to_cedar_request().unwrap();
