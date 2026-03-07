@@ -8,3 +8,10 @@ description = "TLS configuration, certificate generation, and crypto primitives 
 
 [dependencies]
 forge-types = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

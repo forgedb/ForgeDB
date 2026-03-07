@@ -1,4 +1,11 @@
 //! Cryptographic primitives and TLS configuration for ForgeDB.
 //!
-//! Cert generation, server TLS setup, and anything else that touches keys
-//! lives here. Implementation lands in the `feat/security` branch.
+//! Everything that touches keys, certs, or encrypted channels lives here.
+//! Other crates call into `forge-security` — they never handle raw crypto
+//! material directly.
+
+pub mod certgen;
+pub mod tls;
+
+pub use certgen::generate_self_signed_cert;
+pub use tls::build_server_tls_config;
