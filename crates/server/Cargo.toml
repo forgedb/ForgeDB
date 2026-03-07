@@ -7,4 +7,16 @@ repository.workspace = true
 description = "HTTP/REST server for ForgeDB (planned for v0.2+)"
 
 [dependencies]
-forge-types = { workspace = true }
+axum = "0.7"
+bytes = "1.5"
+forge-auth.workspace = true
+forge-query.workspace = true
+forge-storage.workspace = true
+forge-types.workspace = true
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2"] }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }

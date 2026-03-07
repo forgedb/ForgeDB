@@ -96,14 +96,36 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
         forge_security::build_server_tls_config(&config.tls_cert_path, &config.tls_key_path)?;
 
     let db_path = config.data_dir.join("forgedb.redbx");
-    let _engine = forge_storage::StorageEngine::open(&db_path, &password)?;
+    let engine = forge_storage::StorageEngine::open(&db_path, &password)?;
+    let engine = std::sync::Arc::new(engine);
     tracing::info!("database opened successfully");
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = forge_protocol::TlsListener::bind(config.bind_address, tls_config).await?;
         println!("ForgeDB v0.1 listening on {}", config.bind_address);
-        listener.run().await
+
+        let app_state = forge_server::AppState {
+            engine: engine.clone(),
+        };
+        let app = forge_server::app(app_state);
+
+        loop {
+            let (stream, _peer) = match listener.accept().await {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::error!("listener error: {e}");
+                    break;
+                }
+            };
+
+            let app = app.clone();
+
+            tokio::spawn(async move {
+                forge_server::serve_connection(stream, app).await;
+            });
+        }
+        Ok(())
     })
 }
 

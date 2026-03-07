@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::ServerConfig;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -34,31 +33,40 @@ impl TlsListener {
         Ok(Self { tcp, acceptor })
     }
 
-    /// Accept loop — runs forever, spawning a task per connection.
+    /// Accept a single incoming connection and complete the TLS handshake.
     ///
-    /// For v0.1 each connection gets a "ForgeDB v0.1" banner then closes.
-    /// This proves the TLS pipeline end-to-end; actual request handling
-    /// comes in v0.2 when the server crate is wired up.
-    pub async fn run(&self) -> Result<()> {
+    /// The caller is responsible for actually handling the HTTP protocol
+    /// (e.g. passing this stream to `hyper`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Io`] if the socket drops. Handshake failures
+    /// are completely normal (e.g. probes, scans) and won't bubble up here —
+    /// this function will simply log them and grab the next connection.
+    pub async fn accept(
+        &self,
+    ) -> Result<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        SocketAddr,
+    )> {
         loop {
             let (stream, peer) = self.tcp.accept().await?;
             let acceptor = self.acceptor.clone();
 
-            tokio::spawn(async move {
-                match acceptor.accept(stream).await {
-                    Ok(mut tls_stream) => {
-                        tracing::info!(%peer, "TLS handshake complete");
-                        let banner = b"ForgeDB v0.1\n";
-                        if let Err(e) = tls_stream.write_all(banner).await {
-                            tracing::warn!(%peer, "failed to write banner: {e}");
-                        }
-                        let _ = tls_stream.shutdown().await;
-                    }
-                    Err(e) => {
-                        tracing::warn!(%peer, "TLS handshake failed: {e}");
-                    }
+            // Perform TLS handshake concurrently so we don't block the accept loop
+            // if a client is slow to negotiate.
+            let stream_result =
+                tokio::spawn(async move { acceptor.accept(stream).await.map(|s| (s, peer)) }).await;
+
+            match stream_result {
+                Ok(Ok((tls_stream, peer))) => return Ok((tls_stream, peer)),
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, "TLS handshake failed: {e}");
                 }
-            });
+                Err(e) => {
+                    tracing::warn!("TLS handshake task panicked: {e}");
+                }
+            }
         }
     }
 }
