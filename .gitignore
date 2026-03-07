@@ -1,0 +1,20 @@
+# Build artifacts
+/target
+
+# Editor / IDE junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment secrets
+.env
+.env.*
+
+# ForgeDB runtime data — never commit certs, keys, or encrypted DBs
+forgedb_data/
+
+# OS noise
+.DS_Store
+Thumbs.db
