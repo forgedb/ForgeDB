@@ -59,6 +59,10 @@ pub enum ForgeError {
     /// fires a lot when people forget to attach policies — and that's the point.
     #[error("policy error: {0}")]
     Policy(String),
+
+    /// Audit log violations — immutability guarantees or disk failure.
+    #[error("audit error: {0}")]
+    Audit(String),
 }
 
 #[cfg(test)]
@@ -93,6 +97,7 @@ mod tests {
             ForgeError::CertGen("keygen failed".into()),
             ForgeError::Auth("token tampered".into()),
             ForgeError::Policy("deny by default".into()),
+            ForgeError::Audit("immutable violation".into()),
             ForgeError::Io(std::io::Error::other("disk on fire")),
         ];
         for err in &cases {

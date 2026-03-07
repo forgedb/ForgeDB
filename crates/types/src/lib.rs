@@ -4,9 +4,11 @@
 //! no async runtime) so it can be depended on by everything without pulling
 //! in half of crates.io.
 
+pub mod audit;
 pub mod config;
 pub mod error;
 
+pub use audit::{AuditEntry, Outcome};
 pub use config::ForgeConfig;
 pub use error::ForgeError;
 

@@ -703,6 +703,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -1759,7 +1760,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 
@@ -2122,6 +2122,7 @@ checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 
