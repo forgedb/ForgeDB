@@ -8,3 +8,12 @@ description = "PASETO v4 authentication for ForgeDB (planned for v0.2+)"
 
 [dependencies]
 forge-types = { workspace = true }
+pasetors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
