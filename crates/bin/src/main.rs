@@ -100,6 +100,24 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
     let engine = std::sync::Arc::new(engine);
     tracing::info!("database opened successfully");
 
+    // We only need the public half for token verification. Keep the secret key
+    // safely out of memory unless we're actively issuing tokens.
+    let (_, public_key) = forge_auth::keys::load_keys(&config.data_dir)?;
+    let public_key = std::sync::Arc::new(public_key);
+    tracing::info!("PASETO public key loaded for token verification");
+
+    // Load mandatory RLS Cedar policies. If missing, database refuses to start up.
+    let policy_path = config.data_dir.join("policy.cedar");
+    let policy_src = std::fs::read_to_string(&policy_path).map_err(|e| {
+        ForgeError::Config(format!(
+            "failed to read mandatory policy file '{}': {e}",
+            policy_path.display()
+        ))
+    })?;
+    let policy_engine = forge_query::policy::PolicyEngine::new(&policy_src)?;
+    let policy_engine = std::sync::Arc::new(policy_engine);
+    tracing::info!("Cedar enforcement policies loaded successfully");
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = forge_protocol::TlsListener::bind(config.bind_address, tls_config).await?;
@@ -107,6 +125,8 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
 
         let app_state = forge_server::AppState {
             engine: engine.clone(),
+            public_key: public_key.clone(),
+            policy_engine: policy_engine.clone(),
         };
         let app = forge_server::app(app_state);
 

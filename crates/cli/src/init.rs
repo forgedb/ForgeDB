@@ -59,6 +59,22 @@ pub fn run_init(opts: InitOptions) -> Result<()> {
     let _engine = StorageEngine::create(&db_path, &opts.password)?;
     tracing::info!("initialized encrypted database");
 
+    // 3.5 Write a strictly default Cedar policy file so we have a secure baseline
+    let policy_path = opts.data_dir.join("policy.cedar");
+    if !policy_path.exists() {
+        let default_policy = r#"// ForgeDB root access policy
+// This serves as the default blanket administrator policy.
+// It is heavily recommended you restrict this before entering zero-trust production.
+permit(
+    principal,
+    action,
+    resource
+);
+"#;
+        std::fs::write(&policy_path, default_policy)?;
+        tracing::info!("wrote default policy.cedar");
+    }
+
     // 4. Write config file
     let toml_str = toml::to_string_pretty(&config)
         .map_err(|e| ForgeError::Config(format!("failed to serialize config: {e}")))?;
@@ -72,6 +88,7 @@ pub fn run_init(opts: InitOptions) -> Result<()> {
     println!("  TLS certificate: {}", config.tls_cert_path.display());
     println!("  TLS private key: {}", config.tls_key_path.display());
     println!("  Database:        {}", db_path.display());
+    println!("  Policy:          {}", policy_path.display());
     println!("  Config:          {}", config_path.display());
     println!();
     println!("  ⚠  The generated certificate is self-signed (dev only).");

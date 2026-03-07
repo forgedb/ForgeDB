@@ -17,8 +17,11 @@ forge-storage = { workspace = true }
 forge-protocol = { workspace = true }
 forge-cli = { workspace = true }
 forge-server = { workspace = true }
+forge-auth = { workspace = true }
+forge-query = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+pasetors = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

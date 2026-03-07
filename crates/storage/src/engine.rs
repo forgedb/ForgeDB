@@ -106,6 +106,11 @@ impl StorageEngine {
         }
         Ok(results)
     }
+
+    /// Exposes a safe handle for appending entries to the immutable audit log.
+    pub fn audit_log(&self) -> crate::audit::AuditLog<'_> {
+        crate::audit::AuditLog::new(&self.db)
+    }
 }
 
 #[cfg(test)]
