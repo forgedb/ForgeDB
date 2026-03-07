@@ -48,6 +48,17 @@ pub enum ForgeError {
     /// Self-signed certificate generation failure.
     #[error("certificate generation error: {0}")]
     CertGen(String),
+
+    /// PASETO token validation gone sideways — expired, tampered, unknown key,
+    /// you name it. We don't differentiate on purpose; attackers shouldn't get
+    /// a roadmap from our error messages.
+    #[error("auth error: {0}")]
+    Auth(String),
+
+    /// Cedar policy evaluation or parse failure. Deny-by-default means this
+    /// fires a lot when people forget to attach policies
+    #[error("policy error: {0}")]
+    Policy(String),
 }
 
 #[cfg(test)]
@@ -80,6 +91,8 @@ mod tests {
             ForgeError::Tls("cert expired".into()),
             ForgeError::Config("nope".into()),
             ForgeError::CertGen("keygen failed".into()),
+            ForgeError::Auth("token tampered".into()),
+            ForgeError::Policy("deny by default".into()),
             ForgeError::Io(std::io::Error::other("disk on fire")),
         ];
         for err in &cases {
