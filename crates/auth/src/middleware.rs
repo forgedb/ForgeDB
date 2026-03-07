@@ -1,37 +1,82 @@
-//! Bearer token extraction — the thin layer between raw HTTP headers and
-//! our PASETO verification logic.
+//! Bearer token extraction and Axum middleware — the actual security checkpoint.
 //!
-//! Right now this is intentionally minimal: strip the "Bearer " prefix, hand
-//! the rest to `validate_token`, done. When we add the actual HTTP server
-//! (v0.3+), this'll likely grow into proper middleware with `tower::Layer`
-//! or an axum extractor. For now it's a standalone function that the server
-//! crate can call however it wants.
+//! This isn't just a parser anymore; it's the gatekeeper. It strips the "Bearer "
+//! prefix, runs the heavy cryptographic math on the PASETO v4 signature, and either
+//! injects the verified claims straight into the request pipeline or kicks the client
+//! out with a cold 401. I prefer rejecting bad tokens up front so downstream routes
+//! (like Cedar policy enforcement) don't even have to think about malicious payloads.
+//!
+//! # Architecture
+//!
+//! - `require_auth` is an Axum `from_fn` compatible middleware.
+//! - It expects an `Arc<AsymmetricPublicKey<V4>>` to be extractable from the app state.
+//! - On success, it injects `TokenClaims` into the `Extensions` map. Downstream
+//!   handlers or audit loggers can just pull it out like `req.extensions().get::<TokenClaims>()`.
 
+use std::sync::Arc;
+
+use axum::{
+    extract::{Request, State},
+    http::{StatusCode, header::AUTHORIZATION},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use pasetors::keys::AsymmetricPublicKey;
 use pasetors::version4::V4;
 
+use crate::token::{TokenClaims, validate_token};
 use forge_types::{ForgeError, Result};
 
-use crate::token::{TokenClaims, validate_token};
+/// The primary Axum authentication middleware.
+///
+/// Looks for the `Authorization: Bearer <token>` header, validates the asymmetric
+/// PASETO signature against the global public key, and embeds the resulting claims
+/// into the request's extensions map. If the signature is busted, tampered, or expired,
+/// it instantly returns `401 Unauthorized`.
+///
+/// # Note on state
+/// This relies on the core application state handing over an `Arc<AsymmetricPublicKey<V4>>`.
+/// Make sure your server's `AppState` derives `axum::extract::FromRef` or implements
+/// it manually, otherwise you'll get gnarly trait-bound compiler splat here.
+pub async fn require_auth(
+    State(public_key): State<Arc<AsymmetricPublicKey<V4>>>,
+    mut req: Request,
+    next: Next,
+) -> std::result::Result<Response, Response> {
+    let auth_header = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
 
-/// Extracts and validates a PASETO token from an HTTP `Authorization` header.
+    match auth_header {
+        Some(header_val) => match validate_bearer_token(header_val, &public_key) {
+            Ok(claims) => {
+                // Verified. Toss the claims in the extensions so the payload is
+                // easily available for Cedar or basic endpoint handlers.
+                req.extensions_mut().insert(claims);
+                Ok(next.run(req).await)
+            }
+            Err(e) => {
+                // Log what actually went wrong behind the scenes (for us),
+                // but give the attacker nothing more than a generic "no".
+                tracing::warn!("Rejecting token: {e}");
+                Err((StatusCode::UNAUTHORIZED, "Invalid Token").into_response())
+            }
+        },
+        None => {
+            tracing::warn!("Authorization header missing entirely");
+            Err((StatusCode::UNAUTHORIZED, "Missing Authorization Header").into_response())
+        }
+    }
+}
+
+/// The low-level standalone function that actually tears apart the string.
 ///
-/// Expects the format `Bearer v4.public.<payload>`. Anything else — missing
-/// prefix, empty string, garbage — gets a clear [`ForgeError::Auth`].
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use forge_auth::validate_bearer_token;
-/// # use pasetors::keys::AsymmetricPublicKey;
-/// # use pasetors::version4::V4;
-///
-/// // Assuming you have a public key and a header value:
-/// // let claims = validate_bearer_token("Bearer v4.public.abc123...", &pub_key)?;
-/// ```
+/// Expects the format `Bearer v4.public.<payload>`. Anything else gets binned with
+/// a clear [`ForgeError::Auth`]. We keep this decoupled from the Axum handler
+/// because sometimes it's useful to run these checks manually (and it makes unit testing easier).
 ///
 /// # Errors
-///
 /// Returns [`ForgeError::Auth`] if the prefix is wrong or the token fails
 /// verification (expired, tampered, wrong key, etc.).
 pub fn validate_bearer_token(
