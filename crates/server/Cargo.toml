@@ -4,10 +4,10 @@ version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "HTTP/REST server for ForgeDB (planned for v0.2+)"
+description = "HTTP/REST server for ForgeDB"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 bytes = "1.5"
 forge-auth.workspace = true
 forge-query.workspace = true
@@ -15,8 +15,10 @@ forge-storage.workspace = true
 forge-types.workspace = true
 hyper = "1"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "http1", "http2"] }
+pasetors = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+rmp-serde = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
