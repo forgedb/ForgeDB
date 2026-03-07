@@ -731,6 +731,7 @@ dependencies = [
  "forge-storage",
  "forge-types",
  "pasetors",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -808,11 +809,13 @@ dependencies = [
 name = "forge-storage"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "forge-types",
  "redbx",
  "rmp-serde",
  "serde",
  "tempfile",
+ "tokio",
  "tracing",
  "uuid",
 ]

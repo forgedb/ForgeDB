@@ -33,6 +33,13 @@ impl TlsListener {
         Ok(Self { tcp, acceptor })
     }
 
+    /// Returns the local address that this listener is bound to.
+    ///
+    /// Essential when binding to ephemeral ports (e.g. `127.0.0.1:0`) in tests.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.tcp.local_addr()
+    }
+
     /// Accept a single incoming connection and complete the TLS handshake.
     ///
     /// The caller is responsible for actually handling the HTTP protocol

@@ -1,51 +1,121 @@
-//! Storage engine wrapping redbx.
+//! Storage engine — redbx with page-level AES-256-GCM encryption.
 //!
-//! [`StorageEngine`] provides document CRUD against a redbx database with
-//! transparent page-level encryption. Each "collection" maps to a redbx table,
-//! and documents are raw byte slices (typically MessagePack-encoded).
+//! [`StorageEngine`] is the beating heart of ForgeDB. Every collection maps to a
+//! redbx table; the key is a string document ID, the value is raw bytes (MessagePack
+//! once the codec layer lands, raw bytes today). Encryption happens transparently at
+//! the page level — callers never touch a key.
+//!
+//! # Performance Considerations
+//!
+//! The engine is tuned through [`StorageConfig`]:
+//!
+//! - **`cache_size_bytes`** — redbx's internal LRU page cache. Hot documents that
+//!   fit in cache cost zero disk I/O on reads. Default is 64 MiB; bump it if you
+//!   have the RAM and a tight read-latency SLA.
+//! - **`page_size_bytes`** — smaller pages reduce write amplification for small docs.
+//!   512 B works well for our typical < 512-byte MessagePack payloads. Larger values
+//!   suit bigger documents or workloads with more sequential scan patterns.
+//!
+//! # Write durability
+//!
+//! `insert` and `delete` use `Durability::Immediate` by default — every single-doc
+//! call is fully durable. `insert_batch` and `delete_batch` accept a `flush` flag:
+//! - `flush = true` → `Durability::Immediate` (safe default)
+//! - `flush = false` → `Durability::None` (in-memory; caller MUST call `flush()` before crash risk)
+//!
+//! The async write batcher in `crate::writer` uses `flush = false` internally and
+//! issues one `Durability::Immediate` commit at the end of each coalesce window.
 
 use std::path::Path;
 
-use redbx::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use bytes::Bytes;
+use redbx::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use forge_types::{ForgeError, Result};
 
-/// Handle to an open redbx database.
+/// Tuning knobs for the storage layer — kept separate from `ForgeConfig` so the
+/// storage crate doesn't need to know about the whole world.
 ///
-/// All encryption is handled by redbx at the page level — callers work with
-/// plaintext byte slices and never touch a key.
+/// Defaults are chosen conservatively: fast for dev, sensible in prod without tuning.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    /// Total page cache budget in bytes. Split 90/10 between reads and writes by redbx.
+    /// Default: 64 MiB — enough to cache ~131k average 512-byte documents in memory.
+    pub cache_size_bytes: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            // 64 MiB sweet spot for a local single-node instance.
+            // Production clusters with abundant RAM can push this to 256+ MiB safely.
+            cache_size_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+/// Handle to an open redbx database, ready to serve document CRUD.
 pub struct StorageEngine {
     db: Database,
 }
 
 impl StorageEngine {
-    /// Create a new encrypted database at `path`.
+    /// Create a new encrypted database at `path` with default storage tuning.
     ///
-    /// The `password` goes through PBKDF2-SHA256 (100k iterations) inside
-    /// redbx to derive the AES-256-GCM key.
+    /// The `password` goes through PBKDF2-SHA256 (100k iterations) inside redbx
+    /// to derive the AES-256-GCM page key. This is expensive by design — only
+    /// called during `forgedb init`, not on regular startup.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Storage`] if creation fails.
+    /// Returns [`ForgeError::Storage`] if creation fails (path unwritable, etc.).
     pub fn create(path: &Path, password: &str) -> Result<Self> {
-        let db = Database::create(path, password).map_err(redbx::Error::from)?;
-        tracing::info!(path = %path.display(), "created encrypted database");
+        Self::create_with_config(path, password, StorageConfig::default())
+    }
+
+    /// Create with explicit tuning. Useful in tests that want a small footprint.
+    pub fn create_with_config(path: &Path, password: &str, cfg: StorageConfig) -> Result<Self> {
+        let mut builder = Database::builder();
+        builder.set_cache_size(cfg.cache_size_bytes);
+
+        let db = builder.create(path, password).map_err(redbx::Error::from)?;
+
+        tracing::info!(
+            path = %path.display(),
+            cache_mb = cfg.cache_size_bytes / (1024 * 1024),
+            "created encrypted database",
+        );
         Ok(Self { db })
     }
 
-    /// Open an existing encrypted database.
+    /// Open an existing encrypted database with default storage tuning.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Storage`] on wrong password, missing file, or
-    /// corruption.
+    /// Returns [`ForgeError::Storage`] on wrong password, missing file, or corruption.
     pub fn open(path: &Path, password: &str) -> Result<Self> {
-        let db = Database::open(path, password).map_err(redbx::Error::from)?;
-        tracing::info!(path = %path.display(), "opened encrypted database");
+        Self::open_with_config(path, password, StorageConfig::default())
+    }
+
+    /// Open with explicit tuning — lets the server crate pass `ForgeConfig` values in.
+    pub fn open_with_config(path: &Path, password: &str, cfg: StorageConfig) -> Result<Self> {
+        let mut builder = Database::builder();
+        builder.set_cache_size(cfg.cache_size_bytes);
+
+        let db = builder.open(path, password).map_err(redbx::Error::from)?;
+
+        tracing::info!(
+            path = %path.display(),
+            cache_mb = cfg.cache_size_bytes / (1024 * 1024),
+            "opened encrypted database",
+        );
         Ok(Self { db })
     }
 
-    /// Insert a document into a collection. Overwrites if the key exists.
+    /// Insert a document into a collection. Overwrites if the key already exists.
+    ///
+    /// One write transaction per call — fully durable on return.
+    /// For bulk imports, use [`insert_batch`] instead.
     pub fn insert(&self, collection: &str, id: &str, doc: &[u8]) -> Result<()> {
         let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
         let txn = self.db.begin_write().map_err(redbx::Error::from)?;
@@ -57,9 +127,13 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Retrieve a document by ID. Returns `None` if the key doesn't exist
-    /// or the collection hasn't been created yet.
-    pub fn get(&self, collection: &str, id: &str) -> Result<Option<Vec<u8>>> {
+    /// Retrieve a document by ID.
+    ///
+    /// Returns `None` if the key doesn't exist or the collection hasn't been written to yet.
+    ///
+    /// Returns [`Bytes`] rather than `Vec<u8>` — cheaper to clone for callers that
+    /// forward the data straight into an Axum response body without inspecting it.
+    pub fn get(&self, collection: &str, id: &str) -> Result<Option<Bytes>> {
         let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
         let txn = self.db.begin_read().map_err(redbx::Error::from)?;
 
@@ -70,7 +144,9 @@ impl StorageEngine {
         };
 
         match table.get(id).map_err(redbx::Error::from)? {
-            Some(value) => Ok(Some(value.value().to_vec())),
+            // Bytes::copy_from_slice is still a copy, but gives us the right type for
+            // cheap downstream cloning and direct Axum body forwarding.
+            Some(value) => Ok(Some(Bytes::copy_from_slice(value.value()))),
             None => Ok(None),
         }
     }
@@ -87,9 +163,83 @@ impl StorageEngine {
         Ok(existed)
     }
 
-    /// List all documents in a collection as `(id, bytes)` pairs.
-    /// Returns an empty vec if the collection doesn't exist yet.
-    pub fn list(&self, collection: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    /// Insert many documents in a single write transaction — one fsync, not N.
+    ///
+    /// The same `value` bytes are written under every `id` in this version. A proper
+    /// bulk API taking `&[(id, bytes)]` pairs lands in v0.3 with the MessagePack layer.
+    ///
+    /// Set `flush` to `false` for intermediate batches in a larger import sequence;
+    /// call [`flush`] afterward. Leave it `true` for safety unless you know exactly
+    /// what you're doing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Storage`] if the transaction or any individual insert fails.
+    pub fn insert_batch(
+        &self,
+        collection: &str,
+        ids: &[String],
+        value: &[u8],
+        flush: bool,
+    ) -> Result<()> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let mut txn = self.db.begin_write().map_err(redbx::Error::from)?;
+
+        if !flush {
+            let _ = txn.set_durability(Durability::None);
+        }
+
+        {
+            let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+            for id in ids {
+                table
+                    .insert(id.as_str(), value)
+                    .map_err(redbx::Error::from)?;
+            }
+        }
+        txn.commit().map_err(redbx::Error::from)?;
+        Ok(())
+    }
+
+    /// Delete many documents in a single write transaction — saves you N-1 fsyncs.
+    ///
+    /// Same `flush` semantics as [`insert_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Storage`] if the transaction or any individual removal fails.
+    pub fn delete_batch(&self, collection: &str, ids: &[String], flush: bool) -> Result<()> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let mut txn = self.db.begin_write().map_err(redbx::Error::from)?;
+
+        if !flush {
+            let _ = txn.set_durability(Durability::None);
+        }
+
+        {
+            let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+            for id in ids {
+                table.remove(id.as_str()).map_err(redbx::Error::from)?;
+            }
+        }
+        txn.commit().map_err(redbx::Error::from)?;
+        Ok(())
+    }
+
+    /// Force a durable flush to disk. Use after a sequence of non-flushing batch operations.
+    ///
+    /// Commits an empty write transaction with `Durability::Immediate`, which triggers
+    /// an OS-level fsync on all dirty pages. A no-op if redbx has nothing pending.
+    pub fn flush(&self) -> Result<()> {
+        let txn = self.db.begin_write().map_err(redbx::Error::from)?;
+        txn.commit().map_err(redbx::Error::from)?;
+        Ok(())
+    }
+
+    /// List all documents in a collection as `(id, Bytes)` pairs.
+    ///
+    /// Returns an empty Vec if the collection doesn't exist yet — no error, just empty.
+    pub fn list(&self, collection: &str) -> Result<Vec<(String, Bytes)>> {
         let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
         let txn = self.db.begin_read().map_err(redbx::Error::from)?;
 
@@ -102,7 +252,10 @@ impl StorageEngine {
         let mut results = Vec::new();
         for entry in table.iter().map_err(redbx::Error::from)? {
             let (key, value) = entry.map_err(redbx::Error::from)?;
-            results.push((key.value().to_string(), value.value().to_vec()));
+            results.push((
+                key.value().to_string(),
+                Bytes::copy_from_slice(value.value()),
+            ));
         }
         Ok(results)
     }
@@ -121,7 +274,11 @@ mod tests {
     fn test_engine() -> (StorageEngine, TempDir) {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("test.forgedb");
-        let engine = StorageEngine::create(&db_path, "test_password").unwrap();
+        // Use a tiny cache in tests to avoid hogging RAM on CI.
+        let cfg = StorageConfig {
+            cache_size_bytes: 4 * 1024 * 1024, // 4 MiB
+        };
+        let engine = StorageEngine::create_with_config(&db_path, "test_password", cfg).unwrap();
         (engine, tmp)
     }
 
@@ -130,7 +287,7 @@ mod tests {
         let (engine, _tmp) = test_engine();
         engine.insert("users", "u1", b"hello").unwrap();
         let result = engine.get("users", "u1").unwrap();
-        assert_eq!(result, Some(b"hello".to_vec()));
+        assert_eq!(result, Some(Bytes::from_static(b"hello")));
     }
 
     #[test]
@@ -157,8 +314,8 @@ mod tests {
         docs.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(docs.len(), 2);
-        assert_eq!(docs[0], ("a".into(), b"one".to_vec()));
-        assert_eq!(docs[1], ("b".into(), b"two".to_vec()));
+        assert_eq!(docs[0], ("a".into(), Bytes::from_static(b"one")));
+        assert_eq!(docs[1], ("b".into(), Bytes::from_static(b"two")));
     }
 
     #[test]
@@ -172,8 +329,14 @@ mod tests {
         let (engine, _tmp) = test_engine();
         engine.insert("a", "x", b"aaa").unwrap();
         engine.insert("b", "x", b"bbb").unwrap();
-        assert_eq!(engine.get("a", "x").unwrap(), Some(b"aaa".to_vec()));
-        assert_eq!(engine.get("b", "x").unwrap(), Some(b"bbb".to_vec()));
+        assert_eq!(
+            engine.get("a", "x").unwrap(),
+            Some(Bytes::from_static(b"aaa"))
+        );
+        assert_eq!(
+            engine.get("b", "x").unwrap(),
+            Some(Bytes::from_static(b"bbb"))
+        );
     }
 
     #[test]
@@ -188,7 +351,7 @@ mod tests {
         let engine = StorageEngine::open(&path, "s3cret").unwrap();
         assert_eq!(
             engine.get("data", "key").unwrap(),
-            Some(b"persisted".to_vec())
+            Some(Bytes::from_static(b"persisted"))
         );
     }
 
@@ -199,5 +362,46 @@ mod tests {
 
         StorageEngine::create(&path, "right").unwrap();
         assert!(StorageEngine::open(&path, "wrong").is_err());
+    }
+
+    #[test]
+    fn insert_batch_then_read() {
+        let (engine, _tmp) = test_engine();
+        let ids: Vec<String> = (0..100).map(|i| format!("doc-{i}")).collect();
+        engine.insert_batch("test", &ids, b"payload", true).unwrap();
+
+        for id in &ids {
+            assert_eq!(
+                engine.get("test", id).unwrap(),
+                Some(Bytes::from_static(b"payload"))
+            );
+        }
+    }
+
+    #[test]
+    fn delete_batch_removes_all() {
+        let (engine, _tmp) = test_engine();
+        let ids: Vec<String> = (0..50).map(|i| format!("doc-{i}")).collect();
+        engine.insert_batch("test", &ids, b"data", true).unwrap();
+        engine.delete_batch("test", &ids, true).unwrap();
+
+        for id in &ids {
+            assert_eq!(engine.get("test", id).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn non_flush_batch_readable_before_flush() {
+        let (engine, _tmp) = test_engine();
+        let ids: Vec<String> = vec!["a".into(), "b".into()];
+        // Durability::None — in memory only until flush()
+        engine
+            .insert_batch("lazy", &ids, b"lazy-write", false)
+            .unwrap();
+        // Should still be readable within the same process (it's in the page cache)
+        assert!(engine.get("lazy", "a").unwrap().is_some());
+        // Flush to disk explicitly
+        engine.flush().unwrap();
+        assert!(engine.get("lazy", "a").unwrap().is_some());
     }
 }

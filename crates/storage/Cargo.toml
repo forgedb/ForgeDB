@@ -13,6 +13,8 @@ rmp-serde = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+bytes = "1.5"
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
