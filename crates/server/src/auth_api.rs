@@ -1,3 +1,4 @@
+use aws_lc_rs::rand::SecureRandom;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 
@@ -40,11 +41,24 @@ pub async fn setup(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let hash = hex::encode(aws_lc_rs::digest::digest(
-        &aws_lc_rs::digest::SHA256,
+    let mut salt = [0u8; 16];
+    aws_lc_rs::rand::SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut hash_bytes = [0u8; 32];
+    aws_lc_rs::pbkdf2::derive(
+        aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(100_000).unwrap(),
+        &salt,
         payload.password.as_bytes(),
-    ));
-    let doc = serde_json::json!({ "hash": hash });
+        &mut hash_bytes,
+    );
+
+    let doc = serde_json::json!({
+        "hash": hex::encode(hash_bytes),
+        "salt": hex::encode(salt)
+    });
     let bytes = rmp_serde::to_vec_named(&doc).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     state
@@ -79,10 +93,20 @@ pub async fn login(
     let doc: serde_json::Value = forge_storage::document::deserialize_doc(&doc_bytes)
         .unwrap_or_else(|_| serde_json::json!({}));
     let stored_hash = doc.get("hash").and_then(|h| h.as_str()).unwrap_or("");
-    let attempt_hash = hex::encode(aws_lc_rs::digest::digest(
-        &aws_lc_rs::digest::SHA256,
-        payload.password.as_bytes(),
-    ));
+    let stored_salt_hex = doc.get("salt").and_then(|s| s.as_str()).unwrap_or("");
+
+    let salt = hex::decode(stored_salt_hex).unwrap_or_default();
+    let mut attempt_hash_bytes = [0u8; 32];
+    if !salt.is_empty() {
+        aws_lc_rs::pbkdf2::derive(
+            aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(100_000).unwrap(),
+            &salt,
+            payload.password.as_bytes(),
+            &mut attempt_hash_bytes,
+        );
+    }
+    let attempt_hash = hex::encode(attempt_hash_bytes);
 
     if stored_hash != attempt_hash || stored_hash.is_empty() {
         return Err(StatusCode::UNAUTHORIZED);

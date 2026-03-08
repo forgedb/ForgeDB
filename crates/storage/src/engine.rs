@@ -257,39 +257,41 @@ impl StorageEngine {
         }
 
         let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+
+        let mut index_tables = Vec::new();
+        for field in &indexed_fields {
+            let idx_table_name = crate::index::index_table_name(collection, field);
+            let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+            if let Ok(idx_table) = txn.open_table(idx_def) {
+                index_tables.push((field.clone(), idx_table));
+            }
+        }
+
         for &(id, payload) in docs {
             if !indexed_fields.is_empty() {
-                let old_doc = {
-                    let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
-                    table.get(id).ok().flatten().map(|b| b.value().to_vec())
-                };
+                let old_doc = table.get(id).ok().flatten().map(|b| b.value().to_vec());
 
-                for field in &indexed_fields {
-                    let idx_table_name = crate::index::index_table_name(collection, field);
-                    let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
-                    if let Ok(mut idx_table) = txn.open_table(idx_def) {
-                        if let Some(old) = &old_doc
-                            && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field)
-                        {
-                            let key = crate::index::format_index_key(old_val, id);
-                            let _ = idx_table.remove(key.as_slice());
-                        }
-                        if let Ok(Some(new_val)) = crate::extract::extract_field_raw(payload, field)
-                        {
-                            let key = crate::index::format_index_key(new_val, id);
-                            let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
-                        }
+                for (field, idx_table) in &mut index_tables {
+                    if let Some(old) = &old_doc
+                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field)
+                    {
+                        let key = crate::index::format_index_key(old_val, id);
+                        let _ = idx_table.remove(key.as_slice());
+                    }
+                    if let Ok(Some(new_val)) = crate::extract::extract_field_raw(payload, field) {
+                        let key = crate::index::format_index_key(new_val, id);
+                        let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
                     }
                 }
             }
+
+            table.insert(id, payload).map_err(redbx::Error::from)?;
         }
 
-        {
-            let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
-            for (id, payload) in docs {
-                table.insert(*id, *payload).map_err(redbx::Error::from)?;
-            }
-        }
+        drop(table);
+        drop(index_tables);
+
         txn.commit().map_err(redbx::Error::from)?;
         Ok(())
     }
@@ -310,38 +312,40 @@ impl StorageEngine {
         }
 
         let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+
+        let mut index_tables = Vec::new();
+        for field in &indexed_fields {
+            let idx_table_name = crate::index::index_table_name(collection, field);
+            let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+            if let Ok(idx_table) = txn.open_table(idx_def) {
+                index_tables.push((field.clone(), idx_table));
+            }
+        }
+
         for id in ids {
             if !indexed_fields.is_empty() {
-                let old_doc = {
-                    let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
-                    table
-                        .get(id.as_str())
-                        .ok()
-                        .flatten()
-                        .map(|b| b.value().to_vec())
-                };
+                let old_doc = table
+                    .get(id.as_str())
+                    .ok()
+                    .flatten()
+                    .map(|b| b.value().to_vec());
                 if let Some(old) = old_doc {
-                    for field in &indexed_fields {
-                        let idx_table_name = crate::index::index_table_name(collection, field);
-                        let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
-                        if let Ok(mut idx_table) = txn.open_table(idx_def)
-                            && let Ok(Some(old_val)) =
-                                crate::extract::extract_field_raw(&old, field)
-                        {
+                    for (field, idx_table) in &mut index_tables {
+                        if let Ok(Some(old_val)) = crate::extract::extract_field_raw(&old, field) {
                             let key = crate::index::format_index_key(old_val, id.as_str());
                             let _ = idx_table.remove(key.as_slice());
                         }
                     }
                 }
             }
+
+            table.remove(id.as_str()).map_err(redbx::Error::from)?;
         }
 
-        {
-            let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
-            for id in ids {
-                table.remove(id.as_str()).map_err(redbx::Error::from)?;
-            }
-        }
+        drop(table);
+        drop(index_tables);
+
         txn.commit().map_err(redbx::Error::from)?;
         Ok(())
     }
