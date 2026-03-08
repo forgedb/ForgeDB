@@ -56,8 +56,10 @@ pub struct AppState {
 
 /// Builds the master Axum router containing all ForgeDB v1 endpoints.
 pub fn app(state: AppState) -> Router {
-    // Unauthenticated routes — health checks, future dashboard assets
-    let public_routes = Router::new().route("/_/health", get(health));
+    // Unauthenticated routes — health checks, schema introspection, future dashboard assets
+    let public_routes = Router::new()
+        .route("/_/health", get(health))
+        .route("/_/schema", get(schema_info));
 
     // Authenticated API routes — full middleware pipeline
     let api_routes = Router::new()
@@ -66,6 +68,7 @@ pub fn app(state: AppState) -> Router {
             "/v1/{collection}/{id}",
             get(get_doc).patch(update_doc).delete(delete_doc),
         )
+        .route("/v1/_query", axum::routing::post(query_docs_stub))
         // Everything inside /v1 requires a valid PASETO token.
         // The middleware parses the Bearer header and rejects bad tokens fast.
         .route_layer(axum::middleware::from_fn_with_state(
@@ -97,28 +100,75 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// GET /v1/:collection
-/// Lists all documents in a collection as JSON objects.
+/// `GET /_/schema` — Cedar namespace introspection.
 ///
-/// Each stored MessagePack payload is transcoded to JSON on the fly.
-/// Yeah, it's a full scan — pagination and cursors come in v0.3.
+/// Unauthenticated endpoint that returns the structured `SchemaInfo` so the
+/// Leptos dashboard can provide auto-completion for policies.
+async fn schema_info() -> Result<impl IntoResponse, StatusCode> {
+    match forge_query::introspect_schema() {
+        Ok(info) => Ok(Json(info)),
+        Err(e) => {
+            tracing::error!("schema introspection failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// GET /v1/:collection
+/// Lists all documents in a collection.
+///
+/// Transcodes to JSON if requested; otherwise defaults to MessagePack with named fields.
+/// Yeah, it's a full scan — pagination and cursors come in v0.3 Phase B.
 async fn list_docs(
     State(state): State<AppState>,
     Path(collection): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     match state.engine.list(&collection) {
         Ok(docs) => {
-            // Trancscode each MessagePack payload into a JSON value so we can
-            // send back a sane JSON array to the client.
-            let json_docs: Vec<serde_json::Value> = docs
-                .into_iter()
-                .map(|(id, bytes)| {
-                    let doc: serde_json::Value =
-                        rmp_serde::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-                    serde_json::json!({ "id": id, "doc": doc })
-                })
-                .collect();
-            Ok(Json(json_docs))
+            let accept = headers
+                .get(axum::http::header::ACCEPT)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+
+            if accept.contains("application/json") {
+                let json_docs: Vec<serde_json::Value> = docs
+                    .into_iter()
+                    .map(|(id, bytes)| {
+                        let doc: serde_json::Value =
+                            rmp_serde::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                        serde_json::json!({ "id": id, "doc": doc })
+                    })
+                    .collect();
+                Ok((
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_vec(&json_docs).unwrap_or_default(),
+                )
+                    .into_response())
+            } else {
+                // For MessagePack, we need to wrap the internal documents in a structured array.
+                // We use serde_json::Value as an intermediate to deserialize the inner doc and
+                // re-serialize as named msgpack, avoiding strict struct typing.
+                let mut wrapper = Vec::new();
+                for (id, bytes) in docs {
+                    if let Ok(val) = rmp_serde::from_slice::<serde_json::Value>(&bytes) {
+                        wrapper.push(serde_json::json!({ "id": id, "doc": val }));
+                    }
+                }
+                let resp_bytes =
+                    forge_storage::document::serialize_doc_named(&wrapper).map_err(|e| {
+                        tracing::error!("failed to serialize list to msgpack: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
+                Ok((
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "application/msgpack")],
+                    resp_bytes,
+                )
+                    .into_response())
+            }
         }
         Err(e) => {
             tracing::error!("list failed: {e}");
@@ -129,7 +179,7 @@ async fn list_docs(
 
 /// POST /v1/:collection
 /// Inserts a new document. Body can be JSON or MessagePack.
-/// Converts JSON into MessagePack for storage explicitly based on `Content-Type`.
+/// Converts to compact MessagePack for storage explicitly based on `Content-Type`.
 ///
 /// Routes through the [`WriteSender`] coalescing channel so concurrent POSTs
 /// share a single redbx write transaction instead of each one paying its own fsync.
@@ -144,27 +194,60 @@ async fn insert_doc(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // The PRD mandates MessagePack for all storage elements.
+    // Read inbound payload into a generic Value map, then encode as compact MessagePack for disk
     let payload_bytes = if content_type.contains("application/json") {
         let json_val: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
             tracing::warn!("failed to parse JSON payload: {e}");
             StatusCode::BAD_REQUEST
         })?;
-        rmp_serde::to_vec_named(&json_val).map_err(|e| {
+        forge_storage::document::serialize_doc(&json_val).map_err(|e| {
             tracing::error!("failed to re-encode JSON to MessagePack: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     } else {
-        // Assume MessagePack for "application/msgpack", "application/x-msgpack", or plain drops
-        body.to_vec()
+        // Even if they send MessagePack, we re-encode it to ensure it's compact internal format
+        // and physically valid. Don't trust raw bytes from the wire directly onto disk.
+        let val: serde_json::Value =
+            forge_storage::document::deserialize_doc(&body).map_err(|e| {
+                tracing::warn!("failed to parse inbound MessagePack: {e}");
+                StatusCode::BAD_REQUEST
+            })?;
+        forge_storage::document::serialize_doc(&val).map_err(|e| {
+            tracing::error!("failed to finalize MessagePack: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
     };
 
     let id = uuid::Uuid::new_v4().to_string();
 
-    // Route through the write-coalescing channel — concurrent inserts
-    // get batched into a single transaction automatically.
     match state.writer.insert(&collection, &id, payload_bytes).await {
-        Ok(_) => Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id })))),
+        Ok(_) => {
+            // Respect Accept headers even for CREATED responses
+            let accept = headers
+                .get(axum::http::header::ACCEPT)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+
+            let response_body = serde_json::json!({ "id": id });
+
+            if accept.contains("application/json") {
+                Ok((
+                    StatusCode::CREATED,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_vec(&response_body).unwrap_or_default(),
+                )
+                    .into_response())
+            } else {
+                let msg_bytes = forge_storage::document::serialize_doc_named(&response_body)
+                    .unwrap_or_default();
+                Ok((
+                    StatusCode::CREATED,
+                    [(axum::http::header::CONTENT_TYPE, "application/msgpack")],
+                    msg_bytes,
+                )
+                    .into_response())
+            }
+        }
         Err(e) => {
             tracing::error!("insert failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -173,8 +256,8 @@ async fn insert_doc(
 }
 
 /// GET /v1/:collection/:id
-/// Retrieves a specific document by ID. Transcodes native MessagePack to JSON
-/// if the client explicitly requests it via `Accept` headers.
+/// Retrieves a specific document by ID.
+/// Defaults to returning named MessagePack. Transcodes to JSON only if requested.
 async fn get_doc(
     State(state): State<AppState>,
     Path((collection, id)): Path<(String, String)>,
@@ -187,14 +270,15 @@ async fn get_doc(
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("");
 
-            if accept.contains("application/json") {
-                // In a perfect world we would use `serde_transcode`, but bouncing through
-                // `serde_json::Value` works well enough for v0.2 scaffolding.
-                let val: serde_json::Value = rmp_serde::from_slice(&doc).map_err(|e| {
+            // The underlying document is compact MessagePack. We MUST deserialize it
+            // and re-serialize it so we get named fields (for MsgPack responses) or JSON.
+            let val: serde_json::Value =
+                forge_storage::document::deserialize_doc(&doc).map_err(|e| {
                     tracing::error!("failed to read underlying msgpack: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
                 })?;
 
+            if accept.contains("application/json") {
                 let json_bytes = serde_json::to_vec(&val).map_err(|e| {
                     tracing::error!("failed to serialize to json: {e}");
                     StatusCode::INTERNAL_SERVER_ERROR
@@ -207,10 +291,16 @@ async fn get_doc(
                 )
                     .into_response())
             } else {
+                let msg_bytes =
+                    forge_storage::document::serialize_doc_named(&val).map_err(|e| {
+                        tracing::error!("failed to serialize to named msgpack: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+
                 Ok((
                     StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/msgpack")],
-                    doc,
+                    msg_bytes,
                 )
                     .into_response())
             }
@@ -221,6 +311,15 @@ async fn get_doc(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// POST /v1/_query
+/// Safe Joins implementation (placeholder for Phase D).
+async fn query_docs_stub() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Safe Joins landing in v0.3 Phase D",
+    )
 }
 
 /// PATCH /v1/:collection/:id

@@ -9,4 +9,5 @@ description = "Query engine for ForgeDB (planned for v0.2+)"
 [dependencies]
 forge-types = { workspace = true }
 cedar-policy = { workspace = true }
-serde_json = { workspace = true }
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }

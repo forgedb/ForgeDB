@@ -17,18 +17,14 @@ use serde_json::json;
 
 use forge_types::{ForgeError, Result};
 
-/// Spits out the compiled Cedar schema for ForgeDB.
+/// Returns the raw JSON value that defines the ForgeDB Cedar schema.
 ///
-/// This dictates exactly what entity types, actions, and context shapes are actually legal
-/// in the system. Any user policy that tries to invent an action (e.g., `permit(principal, action == Action::"Hack", resource)`)
-/// gets decisively rejected by the engine *before* we even attempt to evaluate it. Fail fast, always.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::Policy`] if our hardcoded JSON schema somehow
-/// turns out to be invalid. Honestly, that should only ever happen during dev when someone typos a brace.
-pub fn forge_schema() -> Result<Schema> {
-    let schema_json = json!({
+/// We expose this separately from [`forge_schema`] because the `cedar_policy::Schema`
+/// type is opaque and doesn't provide a stable way to round-trip back out to JSON.
+/// The introspection API needs to read this raw structure.
+#[must_use]
+pub fn forge_schema_json() -> serde_json::Value {
+    json!({
         "ForgeDB": {
             "entityTypes": {
                 "User": {
@@ -69,9 +65,21 @@ pub fn forge_schema() -> Result<Schema> {
                 }
             }
         }
-    });
+    })
+}
 
-    Schema::from_json_value(schema_json)
+/// Spits out the compiled Cedar schema for ForgeDB.
+///
+/// This dictates exactly what entity types, actions, and context shapes are actually legal
+/// in the system. Any user policy that tries to invent an action (e.g., `permit(principal, action == Action::"Hack", resource)`)
+/// gets decisively rejected by the engine *before* we even attempt to evaluate it. Fail fast, always.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Policy`] if our hardcoded JSON schema somehow
+/// turns out to be invalid. Honestly, that should only ever happen during dev when someone typos a brace.
+pub fn forge_schema() -> Result<Schema> {
+    Schema::from_json_value(forge_schema_json())
         .map_err(|e| ForgeError::Policy(format!("failed to parse built-in Cedar schema: {e}")))
 }
 

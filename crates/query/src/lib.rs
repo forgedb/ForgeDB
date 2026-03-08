@@ -20,8 +20,10 @@
 //! denied. A single `forbid` policy overrides any permits — period.
 
 pub mod context;
+pub mod introspect;
 pub mod policy;
 pub mod schema;
 
 pub use context::AuthContext;
+pub use introspect::introspect_schema;
 pub use policy::PolicyEngine;
