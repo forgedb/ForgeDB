@@ -90,23 +90,38 @@ permit(
     tracing::info!(path = %config_path.display(), "wrote config file");
 
     println!();
-    println!("  ForgeDB initialized successfully!");
+    println!("  \x1b[1;32mForgeDB initialized successfully!\x1b[0m");
     println!();
-    println!("  Data directory:  {}", opts.data_dir.display());
-    println!("  TLS certificate: {}", config.tls_cert_path.display());
-    println!("  TLS private key: {}", config.tls_key_path.display());
     println!(
-        "  PASETO keys:     {}",
+        "  \x1b[1;36mData directory:\x1b[0m  {}",
+        opts.data_dir.display()
+    );
+    println!(
+        "  \x1b[1;36mTLS certificate:\x1b[0m {}",
+        config.tls_cert_path.display()
+    );
+    println!(
+        "  \x1b[1;36mTLS private key:\x1b[0m {}",
+        config.tls_key_path.display()
+    );
+    println!(
+        "  \x1b[1;36mPASETO keys:\x1b[0m     {}",
         opts.data_dir.join("paseto_*.key").display()
     );
-    println!("  Database:        {}", db_path.display());
-    println!("  Policy:          {}", policy_path.display());
-    println!("  Config:          {}", config_path.display());
+    println!("  \x1b[1;36mDatabase:\x1b[0m        {}", db_path.display());
+    println!(
+        "  \x1b[1;36mPolicy:\x1b[0m          {}",
+        policy_path.display()
+    );
+    println!(
+        "  \x1b[1;36mConfig:\x1b[0m          {}",
+        config_path.display()
+    );
     println!();
-    println!("  ⚠  The generated certificate is self-signed (dev only).");
-    println!("     Replace it with a CA-signed cert for production.");
+    println!("\x1b[1;33m  The generated certificate is self-signed (dev only).\x1b[0m");
+    println!("\x1b[1;33m  Replace it with a CA-signed cert for production.\x1b[0m");
     println!();
-    println!("  Next: run `forgedb serve` to start the server.");
+    println!("  \x1b[1mNext:\x1b[0m run \x1b[1;35m`forgedb serve`\x1b[0m to start the server.");
     println!();
 
     Ok(())

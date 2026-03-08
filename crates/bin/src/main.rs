@@ -36,6 +36,21 @@ enum Commands {
         /// Path to forgedb.toml config file.
         #[arg(long, default_value = "./forgedb.toml")]
         config: PathBuf,
+
+        /// Instantly opens the TUI and connects to the running server.
+        #[arg(long, default_value = "true")]
+        with_tui: bool,
+    },
+
+    /// Start the Terminal Dashboard.
+    Tui {
+        /// Address to connect to
+        #[arg(long, default_value = "https://127.0.0.1:5826")]
+        url: String,
+
+        /// PASETO token for authentication
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -46,11 +61,12 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init { data_dir, force } => cmd_init(data_dir, force),
-        Commands::Serve { config } => cmd_serve(config),
+        Commands::Serve { config, with_tui } => cmd_serve(config, with_tui),
+        Commands::Tui { url, token } => forge_cli::tui::run(url, token),
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        eprintln!("\x1b[1;31merror:\x1b[0m {e}");
         std::process::exit(1);
     }
 }
@@ -74,7 +90,7 @@ fn cmd_init(data_dir: PathBuf, force: bool) -> forge_types::Result<()> {
     })
 }
 
-fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
+fn cmd_serve(config_path: PathBuf, with_tui: bool) -> forge_types::Result<()> {
     let toml_str = std::fs::read_to_string(&config_path).map_err(|e| {
         ForgeError::Config(format!(
             "failed to read config '{}': {e}",
@@ -100,11 +116,19 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
     let engine = std::sync::Arc::new(engine);
     tracing::info!("database opened successfully");
 
-    // We only need the public half for token verification. Keep the secret key
-    // safely out of memory unless we're actively issuing tokens.
-    let (_, public_key) = forge_auth::keys::load_keys(&config.data_dir)?;
+    // We only need the public half for token verification.
+    let (secret_key, public_key) = forge_auth::keys::load_keys(&config.data_dir)?;
     let public_key = std::sync::Arc::new(public_key);
-    tracing::info!("PASETO public key loaded for token verification");
+    let secret_key = std::sync::Arc::new(secret_key);
+    tracing::info!("PASETO keys loaded successfully");
+
+    let admin_claims = forge_auth::TokenClaims::new("admin", 30 * 24 * 3600, Some("admin".into()));
+    let admin_token = forge_auth::issue_token(&admin_claims, &secret_key)
+        .map_err(|e| ForgeError::Auth(format!("failed to mint admin token: {e}")))?;
+
+    println!(
+        "\n  \x1b[1;36mDashboard Access Token (Valid 30 days):\x1b[0m \x1b[1;32m{admin_token}\x1b[0m\n"
+    );
 
     // Load mandatory RLS Cedar policies. If missing, database refuses to start up.
     let policy_path = config.data_dir.join("policy.cedar");
@@ -126,7 +150,7 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
 
         let listener = forge_protocol::TlsListener::bind(config.bind_address, tls_config).await?;
         println!(
-            "ForgeDB v{} listening on {}",
+            "\x1b[1;32mForgeDB v{} listening on \x1b[1;36m{}\x1b[0m",
             env!("CARGO_PKG_VERSION"),
             config.bind_address
         );
@@ -142,10 +166,28 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
             engine: engine.clone(),
             writer,
             public_key: public_key.clone(),
+            secret_key: secret_key.clone(),
             policy_engine: policy_engine.clone(),
             cursor_signer,
         };
         let app = forge_server::app(app_state);
+
+        if with_tui {
+            // Give the server a tiny bit to spin its sockets, then launch TUI in this thread.
+            let ip = config.bind_address.ip();
+            let connect_url = if ip.is_unspecified() {
+                format!("https://127.0.0.1:{}", config.bind_address.port())
+            } else {
+                format!("https://{}", config.bind_address)
+            };
+            let token = admin_token.to_string();
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // ignore errors here, if TUI crashes just exit it
+                let _ = forge_cli::tui::run(connect_url, Some(token));
+                std::process::exit(0); // If user exits TUI, kill process.
+            });
+        }
 
         loop {
             let (stream, _peer) = match listener.accept().await {
@@ -174,7 +216,7 @@ fn prompt_password(prompt: &str) -> forge_types::Result<String> {
         return Ok(pw);
     }
 
-    eprint!("{prompt}");
+    eprint!("\x1b[1;36m{prompt}\x1b[0m");
     let mut input = String::new();
     std::io::stdin()
         .read_line(&mut input)
