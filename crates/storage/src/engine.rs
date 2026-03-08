@@ -60,6 +60,17 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
+    /// Crate-internal handle to the raw redbx `Database`.
+    ///
+    /// The write batcher needs this so it can open a single transaction that
+    /// spans every document in a coalesced batch — way cheaper than N
+    /// individual `insert()` calls each with their own fsync.
+    pub(crate) fn raw_db(&self) -> &Database {
+        &self.db
+    }
+}
+
+impl StorageEngine {
     /// Create a new encrypted database at `path` with default storage tuning.
     ///
     /// The `password` goes through PBKDF2-SHA256 (100k iterations) inside redbx

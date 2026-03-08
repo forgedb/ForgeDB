@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use forge_auth::keys;
 use forge_security::generate_self_signed_cert;
 use forge_storage::StorageEngine;
 use forge_types::{ForgeConfig, ForgeError, Result};
@@ -23,13 +24,14 @@ pub struct InitOptions {
 ///
 /// 1. Creates `data_dir` if it doesn't exist
 /// 2. Generates self-signed TLS cert + key
-/// 3. Creates an empty encrypted redbx database
-/// 4. Writes `forgedb.toml` config file
+/// 3. Generates Ed25519 PASETO keypair for token signing
+/// 4. Creates an empty encrypted redbx database
+/// 5. Writes `forgedb.toml` config file
 ///
 /// # Errors
 ///
-/// Returns an error if any step fails — mkdir, cert gen, db creation, or
-/// config writing.
+/// Returns an error if any step fails — mkdir, cert gen, key gen, db creation,
+/// or config writing.
 pub fn run_init(opts: InitOptions) -> Result<()> {
     let config = ForgeConfig::default_with_data_dir(opts.data_dir.clone());
 
@@ -54,12 +56,18 @@ pub fn run_init(opts: InitOptions) -> Result<()> {
     // 2. Generate self-signed TLS cert + key
     generate_self_signed_cert(&config.tls_cert_path, &config.tls_key_path)?;
 
-    // 3. Create empty encrypted database
+    // 3. Generate PASETO Ed25519 keypair — the identity backbone.
+    //    Without this, `forgedb serve` can't verify a single token.
+    let kp = keys::generate_keypair()?;
+    keys::save_keys(&opts.data_dir, &kp.secret, &kp.public)?;
+    tracing::info!("generated Ed25519 PASETO keypair");
+
+    // 4. Create empty encrypted database
     let db_path = opts.data_dir.join("forgedb.redbx");
     let _engine = StorageEngine::create(&db_path, &opts.password)?;
     tracing::info!("initialized encrypted database");
 
-    // 3.5 Write a strictly default Cedar policy file so we have a secure baseline
+    // 5. Write a strictly default Cedar policy file so we have a secure baseline
     let policy_path = opts.data_dir.join("policy.cedar");
     if !policy_path.exists() {
         let default_policy = r#"// ForgeDB root access policy
@@ -75,7 +83,7 @@ permit(
         tracing::info!("wrote default policy.cedar");
     }
 
-    // 4. Write config file
+    // 6. Write config file
     let toml_str = toml::to_string_pretty(&config)
         .map_err(|e| ForgeError::Config(format!("failed to serialize config: {e}")))?;
     std::fs::write(&config_path, toml_str)?;
@@ -87,6 +95,10 @@ permit(
     println!("  Data directory:  {}", opts.data_dir.display());
     println!("  TLS certificate: {}", config.tls_cert_path.display());
     println!("  TLS private key: {}", config.tls_key_path.display());
+    println!(
+        "  PASETO keys:     {}",
+        opts.data_dir.join("paseto_*.key").display()
+    );
     println!("  Database:        {}", db_path.display());
     println!("  Policy:          {}", policy_path.display());
     println!("  Config:          {}", config_path.display());

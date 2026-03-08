@@ -120,11 +120,20 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        // Spin up the write-coalescing background task. Concurrent POST requests
+        // get batched into a single redbx transaction automatically.
+        let writer = forge_storage::spawn_writer(engine.clone());
+
         let listener = forge_protocol::TlsListener::bind(config.bind_address, tls_config).await?;
-        println!("ForgeDB v0.1 listening on {}", config.bind_address);
+        println!(
+            "ForgeDB v{} listening on {}",
+            env!("CARGO_PKG_VERSION"),
+            config.bind_address
+        );
 
         let app_state = forge_server::AppState {
             engine: engine.clone(),
+            writer,
             public_key: public_key.clone(),
             policy_engine: policy_engine.clone(),
         };
