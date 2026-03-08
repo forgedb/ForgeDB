@@ -7,10 +7,12 @@
 pub mod audit;
 pub mod config;
 pub mod error;
+pub mod pagination;
 
 pub use audit::{AuditEntry, Outcome};
 pub use config::ForgeConfig;
 pub use error::ForgeError;
+pub use pagination::{PaginatedResponse, PaginationParams};
 
 /// Shorthand for `std::result::Result<T, ForgeError>`.
 pub type Result<T> = std::result::Result<T, ForgeError>;

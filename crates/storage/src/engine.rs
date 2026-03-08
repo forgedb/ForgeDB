@@ -60,17 +60,6 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    /// Crate-internal handle to the raw redbx `Database`.
-    ///
-    /// The write batcher needs this so it can open a single transaction that
-    /// spans every document in a coalesced batch — way cheaper than N
-    /// individual `insert()` calls each with their own fsync.
-    pub(crate) fn raw_db(&self) -> &Database {
-        &self.db
-    }
-}
-
-impl StorageEngine {
     /// Create a new encrypted database at `path` with default storage tuning.
     ///
     /// The `password` goes through PBKDF2-SHA256 (100k iterations) inside redbx
@@ -268,6 +257,119 @@ impl StorageEngine {
         }
         Ok(results)
     }
+}
+
+/// A page of documents returned from `list_paginated`.
+/// Contains the items and an optional cursor for the next page.
+pub type PaginatedList = (Vec<(String, Bytes)>, Option<String>);
+
+impl StorageEngine {
+    /// List documents with cursor-based pagination.
+    ///
+    /// Fetches up to `limit + 1` records starting *after* the provided `cursor`.
+    /// The `+ 1` trick allows us to detect if there's a subsequent page without
+    /// running a separate (and potentially costly) count query.
+    ///
+    /// # Errors
+    /// Returns [`ForgeError::Storage`] if the read transaction fails.
+    pub fn list_paginated(
+        &self,
+        collection: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<PaginatedList> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let txn = self.db.begin_read().map_err(redbx::Error::from)?;
+
+        let table = match txn.open_table(table_def) {
+            Ok(t) => t,
+            Err(redbx::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
+            Err(e) => return Err(ForgeError::Storage(e.into())),
+        };
+
+        let mut results: Vec<(String, Bytes)> = Vec::with_capacity(limit + 1);
+        let mut next_cursor = None;
+
+        if let Some(c) = cursor {
+            // True keyset pagination: ask the B-Tree to start strictly AFTER the cursor
+            let iter = table
+                .range::<&str>((std::ops::Bound::Excluded(c), std::ops::Bound::Unbounded))
+                .map_err(redbx::Error::from)?;
+            for entry in iter {
+                let (key, value) = entry.map_err(redbx::Error::from)?;
+                let id = key.value().to_string();
+
+                results.push((id, Bytes::copy_from_slice(value.value())));
+                if results.len() > limit {
+                    break;
+                }
+            }
+        } else {
+            let iter = table.iter().map_err(redbx::Error::from)?;
+            for entry in iter {
+                let (key, value) = entry.map_err(redbx::Error::from)?;
+                let id = key.value().to_string();
+
+                results.push((id, Bytes::copy_from_slice(value.value())));
+                if results.len() > limit {
+                    break;
+                }
+            }
+        }
+
+        if results.len() > limit {
+            // We got one more than asked for, which means there is a next page.
+            // The cursor for the next page is the ID of the last item *on this page*.
+            results.pop(); // Remove that extra item so we only return `limit` items
+            next_cursor = results.last().map(|(k, _)| k.clone());
+        }
+
+        Ok((results, next_cursor))
+    }
+
+    /// Read-modify-write a document atomically within a single transaction.
+    ///
+    /// The `merge_fn` receives `(existing_bytes, patch_bytes)` and returns the merged bytes.
+    /// This separation keeps the storage layer entirely codec-agnostic while ensuring
+    /// the fetch and write happen without intervening mutations.
+    ///
+    /// # Errors
+    /// Returns [`ForgeError::Storage`] if the document doesn't exist, if the read/write
+    /// fails, or if `merge_fn` returns an error.
+    pub fn update_doc(
+        &self,
+        collection: &str,
+        id: &str,
+        patch: &[u8],
+        merge_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let txn = self.db.begin_write().map_err(redbx::Error::from)?;
+
+        let merged = {
+            let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+
+            let existing = table.get(id).map_err(redbx::Error::from)?.ok_or_else(|| {
+                ForgeError::Storage(redbx::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("document '{id}' not found for patch"),
+                )))
+            })?;
+
+            merge_fn(existing.value(), patch)?
+        };
+
+        // We re-open the table block to bypass borrow-checker holding `existing`
+        {
+            let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+            table
+                .insert(id, merged.as_slice())
+                .map_err(redbx::Error::from)?;
+        }
+
+        txn.commit().map_err(redbx::Error::from)?;
+        Ok(merged)
+    }
 
     /// Exposes a safe handle for appending entries to the immutable audit log.
     pub fn audit_log(&self) -> crate::audit::AuditLog<'_> {
@@ -331,6 +433,72 @@ mod tests {
     fn list_empty_collection() {
         let (engine, _tmp) = test_engine();
         assert!(engine.list("ghost").unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_paginated() {
+        let (engine, _tmp) = test_engine();
+        // Insert 5 items
+        for i in 1..=5 {
+            engine
+                .insert("items", &format!("k{i}"), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+
+        // Page 1: limits to 2, returns cursor "k2"
+        let (p1, cursor1) = engine.list_paginated("items", None, 2).unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(p1[0].0, "k1");
+        assert_eq!(p1[1].0, "k2");
+        assert_eq!(cursor1.as_deref(), Some("k2"));
+
+        // Page 2: starts after "k2", limits to 2, returns cursor "k4"
+        let (p2, cursor2) = engine
+            .list_paginated("items", cursor1.as_deref(), 2)
+            .unwrap();
+        assert_eq!(p2.len(), 2);
+        assert_eq!(p2[0].0, "k3");
+        assert_eq!(p2[1].0, "k4");
+        assert_eq!(cursor2.as_deref(), Some("k4"));
+
+        // Page 3: starts after "k4", limits to 2, gets 1, cursor None
+        let (p3, cursor3) = engine
+            .list_paginated("items", cursor2.as_deref(), 2)
+            .unwrap();
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3[0].0, "k5");
+        assert_eq!(cursor3, None);
+
+        // Page 4: empty
+        let (p4, cursor4) = engine.list_paginated("items", Some("k5"), 2).unwrap();
+        assert!(p4.is_empty());
+        assert_eq!(cursor4, None);
+    }
+
+    #[test]
+    fn update_doc_atomic_patch() {
+        let (engine, _tmp) = test_engine();
+        engine.insert("users", "u1", b"original").unwrap();
+
+        let patched = engine
+            .update_doc("users", "u1", b"patched", |old, new| {
+                assert_eq!(old, b"original");
+                Ok(new.to_vec())
+            })
+            .unwrap();
+
+        assert_eq!(patched, b"patched");
+
+        // Verify the write was actually persisted
+        let verify = engine.get("users", "u1").unwrap();
+        assert_eq!(verify.unwrap(), b"patched".as_slice());
+    }
+
+    #[test]
+    fn update_doc_returns_not_found() {
+        let (engine, _tmp) = test_engine();
+        let res = engine.update_doc("ghosts", "g1", b"boo", |_, new| Ok(new.to_vec()));
+        assert!(matches!(res, Err(ForgeError::Storage(_))));
     }
 
     #[test]

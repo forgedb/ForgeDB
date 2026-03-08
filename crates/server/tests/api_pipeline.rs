@@ -201,3 +201,125 @@ async fn garbage_bearer_token_returns_401() {
         "garbage token must be rejected"
     );
 }
+
+#[tokio::test]
+async fn paginate_documents() {
+    let (app, token, _tmp) = test_harness();
+
+    // Insert 3 documents
+    for i in 1..=3 {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/items")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(r#"{{"idx":{i}}}"#)))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Fetch page 1 (limit=2)
+    let req1 = Request::builder()
+        .uri("/v1/items?limit=2")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "application/json")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp1.into_body(), 4096).await.unwrap();
+    let body: forge_types::pagination::PaginatedResponse<serde_json::Value> =
+        serde_json::from_slice(&body_bytes).unwrap();
+
+    assert_eq!(body.data.len(), 2);
+    assert!(body.has_more);
+    let next_cursor = body.next_cursor.expect("must have cursor");
+
+    // Fetch page 2 (limit=2, cursor=next_cursor)
+    let req2 = Request::builder()
+        .uri(format!("/v1/items?limit=2&cursor={next_cursor}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "application/json")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp2.into_body(), 4096).await.unwrap();
+    let body: forge_types::pagination::PaginatedResponse<serde_json::Value> =
+        serde_json::from_slice(&body_bytes).unwrap();
+
+    assert_eq!(body.data.len(), 1);
+    assert!(!body.has_more);
+    assert_eq!(body.next_cursor, None);
+}
+
+#[tokio::test]
+async fn patch_document() {
+    let (app, token, _tmp) = test_harness();
+
+    // 1. Insert original
+    let insert_req = Request::builder()
+        .method("POST")
+        .uri("/v1/items")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::from(r#"{"name":"test","value":42,"keep":"this"}"#))
+        .unwrap();
+
+    let insert_resp = app.clone().oneshot(insert_req).await.unwrap();
+    assert_eq!(insert_resp.status(), StatusCode::CREATED);
+
+    let body_bytes = axum::body::to_bytes(insert_resp.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let doc_id = body["id"].as_str().expect("id required");
+
+    // 2. Patch document (update value, delete name, add new_field)
+    let patch_req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/v1/items/{doc_id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
+        .body(Body::from(
+            r#"{"value":99,"name":null,"new_field":"added"}"#,
+        ))
+        .unwrap();
+
+    let patch_resp = app.clone().oneshot(patch_req).await.unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+
+    // 3. Verify changes were applied completely
+    let get_req = Request::builder()
+        .uri(format!("/v1/items/{doc_id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "application/json")
+        .body(Body::empty())
+        .unwrap();
+
+    let get_resp = app.oneshot(get_req).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let final_bytes = axum::body::to_bytes(get_resp.into_body(), 4096)
+        .await
+        .unwrap();
+
+    let final_body: serde_json::Value = serde_json::from_slice(&final_bytes).unwrap();
+    println!("FINAL BODY: {}", final_body);
+
+    let doc = &final_body;
+    assert_eq!(doc["value"], 99);
+    assert_eq!(doc["keep"], "this");
+    assert_eq!(doc["new_field"], "added");
+    assert!(
+        doc.get("name").is_none(),
+        "name should be deleted (null merge semantics)"
+    );
+}
