@@ -1,10 +1,10 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/jonathanmagambo/ForgeDB/main/assets/logo.png" alt="ForgeDB Logo" width="120">
+  <img src="https://github.com/forgedb/ForgeDB/blob/main/forge.png?raw=true" alt="ForgeDB Logo" width="200">
   
   <h1>ForgeDB</h1>
   
-  [<img alt="github" src="https://img.shields.io/badge/github-jonathanmagambo/forgedb-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/jonathanmagambo/ForgeDB)
-  [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/jonathanmagambo/ForgeDB/rust.yml?branch=main&style=for-the-badge" height="20">](https://github.com/jonathanmagambo/ForgeDB/actions)
+  [<img alt="github" src="https://img.shields.io/badge/github-forgedb/ForgeDB-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/forgedb/ForgeDB)
+  [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/forgedb/ForgeDB/rust.yml?branch=main&style=for-the-badge" height="20">](https://github.com/forgedb/ForgeDB/actions)
 </div>
 
 <div align="center">
