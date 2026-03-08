@@ -463,7 +463,7 @@ impl App {
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```no_run
 /// use forge_cli::tui;
 ///
 /// // Assuming the server is up at localhost:5826
