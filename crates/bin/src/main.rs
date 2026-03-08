@@ -51,6 +51,10 @@ enum Commands {
         /// PASETO token for authentication
         #[arg(long)]
         token: Option<String>,
+
+        /// Path to the TLS certificate (required for self-signed development certs)
+        #[arg(long)]
+        cert: Option<PathBuf>,
     },
 }
 
@@ -62,7 +66,7 @@ fn main() {
     let result = match cli.command {
         Commands::Init { data_dir, force } => cmd_init(data_dir, force),
         Commands::Serve { config, with_tui } => cmd_serve(config, with_tui),
-        Commands::Tui { url, token } => forge_cli::tui::run(url, token),
+        Commands::Tui { url, token, cert } => forge_cli::tui::run(url, token, cert),
     };
 
     if let Err(e) = result {
@@ -181,10 +185,11 @@ fn cmd_serve(config_path: PathBuf, with_tui: bool) -> forge_types::Result<()> {
                 format!("https://{}", config.bind_address)
             };
             let token = admin_token.to_string();
+            let cert_path = config.tls_cert_path.clone(); // Pass the local cert path
             tokio::task::spawn_blocking(move || {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 // ignore errors here, if TUI crashes just exit it
-                let _ = forge_cli::tui::run(connect_url, Some(token));
+                let _ = forge_cli::tui::run(connect_url, Some(token), Some(cert_path));
                 std::process::exit(0); // If user exits TUI, kill process.
             });
         }

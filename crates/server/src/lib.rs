@@ -85,6 +85,7 @@ pub fn app(state: AppState) -> Router {
     // Authenticated API routes
     let api = Router::new()
         .route("/_/schema", get(schema_info))
+        .route("/_/auth/users", axum::routing::post(auth_api::create_user))
         .route("/v1/{collection}", get(list_docs).post(insert_doc))
         .route(
             "/v1/{collection}/{id}",

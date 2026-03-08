@@ -43,10 +43,12 @@ enum AppScreen {
     Dashboard,
     Editor,
     NewCollection,
+    NewUser, // Screen for adding a new user
 }
 
 struct AuthForm {
     token: String,
+    username: String,
     password: String,
     confirm: String,
     focused: usize,
@@ -90,12 +92,21 @@ struct App {
     is_deleting: bool,
 }
 
+use std::path::PathBuf;
+
 impl App {
-    fn new(url: String, token: Option<String>) -> App {
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
+    fn new(url: String, token: Option<String>, cert_path: Option<PathBuf>) -> App {
+        let mut builder = Client::builder();
+
+        if let Some(path) = cert_path {
+            if let Ok(cert_bytes) = std::fs::read(&path) {
+                if let Ok(cert) = reqwest::Certificate::from_pem(&cert_bytes) {
+                    builder = builder.add_root_certificate(cert);
+                }
+            }
+        }
+
+        let client = builder.build().unwrap_or_else(|_| Client::new());
 
         App {
             url,
@@ -105,6 +116,7 @@ impl App {
 
             auth_form: AuthForm {
                 token: token.unwrap_or_default(),
+                username: String::new(),
                 password: String::new(),
                 confirm: String::new(),
                 focused: 0,
@@ -175,6 +187,7 @@ impl App {
                 if resp.status().is_success() {
                     self.status_msg = "Setup successful! Proceed to Login...".to_string();
                     self.screen = AppScreen::Login;
+                    self.auth_form.username = "admin".into();
                     self.auth_form.password.clear();
                     self.auth_form.confirm.clear();
                     self.auth_form.focused = 1;
@@ -187,7 +200,7 @@ impl App {
     }
 
     async fn submit_login(&mut self) {
-        let body = serde_json::json!({ "password": self.auth_form.password });
+        let body = serde_json::json!({ "username": self.auth_form.username, "password": self.auth_form.password });
         match self
             .client
             .post(format!("{}/_/auth/login", self.url))
@@ -206,6 +219,36 @@ impl App {
                     }
                 } else {
                     self.status_msg = "Login failed: Unauthorized.".to_string();
+                }
+            }
+            Err(e) => self.status_msg = format!("Request failed: {}", e),
+        }
+    }
+
+    async fn submit_new_user(&mut self) {
+        if self.auth_form.password != self.auth_form.confirm {
+            self.status_msg = "Passwords do not match!".to_string();
+            return;
+        }
+        let body = serde_json::json!({
+            "username": self.auth_form.username,
+            "password": self.auth_form.password
+        });
+        let req = self.client.post(format!("{}/_/auth/users", self.url));
+        let req = if let Some(t) = &self.bearer_token {
+            req.bearer_auth(t)
+        } else {
+            req
+        };
+        match req.json(&body).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    self.status_msg = format!("User '{}' created.", self.auth_form.username);
+                    self.screen = AppScreen::Dashboard;
+                } else if resp.status() == 403 {
+                    self.status_msg = "Forbidden: Need admin role to create users.".to_string();
+                } else {
+                    self.status_msg = format!("Failed to create user: {}", resp.status());
                 }
             }
             Err(e) => self.status_msg = format!("Request failed: {}", e),
@@ -370,6 +413,7 @@ impl App {
             AppScreen::Login => self.handle_login_input(code),
             AppScreen::Editor => self.handle_editor_input(code),
             AppScreen::NewCollection => self.handle_new_col_input(code),
+            AppScreen::NewUser => self.handle_new_user_input(code),
             _ => {}
         }
     }
@@ -402,12 +446,48 @@ impl App {
 
     fn handle_login_input(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Backspace => {
-                self.auth_form.password.pop();
-            }
-            KeyCode::Char(c) => {
-                self.auth_form.password.push(c);
-            }
+            KeyCode::Tab => self.auth_form.focused = (self.auth_form.focused + 1) % 2,
+            KeyCode::BackTab => self.auth_form.focused = (self.auth_form.focused + 1) % 2,
+            KeyCode::Backspace => match self.auth_form.focused {
+                0 => {
+                    self.auth_form.username.pop();
+                }
+                1 => {
+                    self.auth_form.password.pop();
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) => match self.auth_form.focused {
+                0 => self.auth_form.username.push(c),
+                1 => self.auth_form.password.push(c),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn handle_new_user_input(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Tab => self.auth_form.focused = (self.auth_form.focused + 1) % 3,
+            KeyCode::BackTab => self.auth_form.focused = (self.auth_form.focused + 2) % 3,
+            KeyCode::Backspace => match self.auth_form.focused {
+                0 => {
+                    self.auth_form.username.pop();
+                }
+                1 => {
+                    self.auth_form.password.pop();
+                }
+                2 => {
+                    self.auth_form.confirm.pop();
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) => match self.auth_form.focused {
+                0 => self.auth_form.username.push(c),
+                1 => self.auth_form.password.push(c),
+                2 => self.auth_form.confirm.push(c),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -476,9 +556,13 @@ impl App {
 /// # Errors
 ///
 /// Returns a `forge_types::Result` if terminal initialization or restoration fails.
-pub fn run(url: String, token: Option<String>) -> forge_types::Result<()> {
+pub fn run(
+    url: String,
+    token: Option<String>,
+    cert_path: Option<PathBuf>,
+) -> forge_types::Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut app = App::new(url, token);
+    let mut app = App::new(url, token, cert_path);
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     rt.block_on(async {
@@ -554,6 +638,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                 AppScreen::Login => {
                     if key.code == KeyCode::Enter {
                         app.submit_login().await;
+                    } else {
+                        app.handle_input(key.code);
+                    }
+                }
+                AppScreen::NewUser => {
+                    if key.code == KeyCode::Enter {
+                        app.submit_new_user().await;
                     } else {
                         app.handle_input(key.code);
                     }
@@ -646,6 +737,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                         KeyCode::Char('n') => {
                             app.new_col_name.clear();
                             app.screen = AppScreen::NewCollection;
+                        }
+                        KeyCode::Char('u') => {
+                            app.auth_form.username.clear();
+                            app.auth_form.password.clear();
+                            app.auth_form.confirm.clear();
+                            app.auth_form.focused = 0;
+                            app.screen = AppScreen::NewUser;
                         }
                         KeyCode::Char('e') => {
                             // Gotta make sure we actually have a document and a collection selected.
@@ -740,8 +838,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     draw_header(f, app, chunks[0]);
     match app.screen {
         AppScreen::Initializing => draw_initializing(f, app, chunks[1]),
-        AppScreen::Setup => draw_auth_form(f, app, chunks[1], true),
-        AppScreen::Login => draw_auth_form(f, app, chunks[1], false),
+        AppScreen::Setup => draw_auth_form(f, app, chunks[1]),
+        AppScreen::Login => draw_auth_form(f, app, chunks[1]),
+        AppScreen::NewUser => draw_auth_form(f, app, chunks[1]),
         AppScreen::Dashboard => draw_dashboard(f, app, chunks[1]),
         AppScreen::Editor => draw_editor(f, app, chunks[1]),
         AppScreen::NewCollection => draw_new_col_dialog(f, app, chunks[1]),
@@ -782,7 +881,7 @@ fn draw_header(f: &mut Frame, _app: &mut App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let help = match app.screen {
         AppScreen::Dashboard => {
-            " [N] New Col  [A] Add  [E] Edit  [D] Del  [R] Sync  [TAB] Swap Focus  [Esc] Quit "
+            " [N] New Col  [A] Add  [E] Edit  [D] Del  [R] Sync  [U] New User  [TAB] Swap Focus  [Esc] Quit "
         }
         AppScreen::Editor => " [Ctrl+S] Store  [Esc] Back  Type to edit JSON directly ",
         AppScreen::NewCollection => " [Enter] Confirm  [Esc] Cancel ",
@@ -810,28 +909,31 @@ fn draw_initializing(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
-fn draw_auth_form(f: &mut Frame, app: &mut App, area: Rect, is_setup: bool) {
+fn draw_auth_form(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(12), Constraint::Min(0)])
         .split(center_rect(60, 40, area));
 
+    let title = match app.screen {
+        AppScreen::Setup => " SETUP ",
+        AppScreen::Login => " LOGIN ",
+        AppScreen::NewUser => " ADD DB USER ",
+        _ => " FORM ",
+    };
+
     let block = Block::default()
-        .title(if is_setup {
-            " ADMIN SETUP "
-        } else {
-            " ADMIN LOGIN "
-        })
+        .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(203, 213, 225)))
-        .style(Style::default().bg(Color::White).fg(Color::Black));
+        .border_style(Style::default().fg(Color::Rgb(56, 189, 248)))
+        .style(Style::default()); // No background, as requested
 
     f.render_widget(Clear, chunks[0]);
     f.render_widget(block.clone(), chunks[0]);
 
     let inputs = Layout::default()
         .direction(Direction::Vertical)
-        .margin(1)
+        .margin(2)
         .constraints([
             Constraint::Length(2),
             Constraint::Length(2),
@@ -845,43 +947,104 @@ fn draw_auth_form(f: &mut Frame, app: &mut App, area: Rect, is_setup: bool) {
         .add_modifier(Modifier::BOLD);
     let inactive = Style::default().fg(Color::Rgb(148, 163, 184));
 
-    if is_setup {
-        f.render_widget(
-            Paragraph::new(format!("PASETO: {}", app.auth_form.token)).style(
-                if app.auth_form.focused == 0 {
+    match app.screen {
+        AppScreen::Setup => {
+            f.render_widget(
+                Paragraph::new(format!("PASETO: {}", app.auth_form.token)).style(
+                    if app.auth_form.focused == 0 {
+                        active
+                    } else {
+                        inactive
+                    },
+                ),
+                inputs[0],
+            );
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Password: {}",
+                    "*".repeat(app.auth_form.password.len())
+                ))
+                .style(if app.auth_form.focused == 1 {
                     active
                 } else {
                     inactive
-                },
-            ),
-            inputs[0],
-        );
-    }
-    f.render_widget(
-        Paragraph::new(format!(
-            "Password: {}",
-            "*".repeat(app.auth_form.password.len())
-        ))
-        .style(if app.auth_form.focused == 1 {
-            active
-        } else {
-            inactive
-        }),
-        inputs[1],
-    );
-    if is_setup {
-        f.render_widget(
-            Paragraph::new(format!(
-                "Confirm: {}",
-                "*".repeat(app.auth_form.confirm.len())
-            ))
-            .style(if app.auth_form.focused == 2 {
-                active
-            } else {
-                inactive
-            }),
-            inputs[2],
-        );
+                }),
+                inputs[1],
+            );
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Confirm:  {}",
+                    "*".repeat(app.auth_form.confirm.len())
+                ))
+                .style(if app.auth_form.focused == 2 {
+                    active
+                } else {
+                    inactive
+                }),
+                inputs[2],
+            );
+        }
+        AppScreen::Login => {
+            f.render_widget(
+                Paragraph::new(format!("Username: {}", app.auth_form.username)).style(
+                    if app.auth_form.focused == 0 {
+                        active
+                    } else {
+                        inactive
+                    },
+                ),
+                inputs[0],
+            );
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Password: {}",
+                    "*".repeat(app.auth_form.password.len())
+                ))
+                .style(if app.auth_form.focused == 1 {
+                    active
+                } else {
+                    inactive
+                }),
+                inputs[1],
+            );
+        }
+        AppScreen::NewUser => {
+            f.render_widget(
+                Paragraph::new(format!("Username: {}", app.auth_form.username)).style(
+                    if app.auth_form.focused == 0 {
+                        active
+                    } else {
+                        inactive
+                    },
+                ),
+                inputs[0],
+            );
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Password: {}",
+                    "*".repeat(app.auth_form.password.len())
+                ))
+                .style(if app.auth_form.focused == 1 {
+                    active
+                } else {
+                    inactive
+                }),
+                inputs[1],
+            );
+            f.render_widget(
+                Paragraph::new(format!(
+                    "Confirm:  {}",
+                    "*".repeat(app.auth_form.confirm.len())
+                ))
+                .style(if app.auth_form.focused == 2 {
+                    active
+                } else {
+                    inactive
+                }),
+                inputs[2],
+            );
+        }
+        _ => {}
     }
 }
 

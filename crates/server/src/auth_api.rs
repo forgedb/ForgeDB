@@ -12,7 +12,7 @@ pub struct AuthStatus {
 pub async fn auth_status(State(state): State<AppState>) -> impl IntoResponse {
     let setup_required = state
         .engine
-        .get("_system", "admin_auth")
+        .get("_users", "admin")
         .map(|o| o.is_none())
         .unwrap_or(true);
     (StatusCode::OK, Json(AuthStatus { setup_required }))
@@ -34,7 +34,7 @@ pub async fn setup(
 
     let setup_required = state
         .engine
-        .get("_system", "admin_auth")
+        .get("_users", "admin")
         .map(|o| o.is_none())
         .unwrap_or(true);
     if !setup_required {
@@ -57,13 +57,14 @@ pub async fn setup(
 
     let doc = serde_json::json!({
         "hash": hex::encode(hash_bytes),
-        "salt": hex::encode(salt)
+        "salt": hex::encode(salt),
+        "role": "admin"
     });
     let bytes = rmp_serde::to_vec_named(&doc).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     state
         .engine
-        .insert("_system", "admin_auth", &bytes)
+        .insert("_users", "admin", &bytes)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::OK)
@@ -71,6 +72,7 @@ pub async fn setup(
 
 #[derive(Deserialize)]
 pub struct LoginReq {
+    pub username: String,
     pub password: String,
 }
 
@@ -85,7 +87,7 @@ pub async fn login(
 ) -> Result<impl IntoResponse, StatusCode> {
     let doc_bytes = state
         .engine
-        .get("_system", "admin_auth")
+        .get("_users", &payload.username)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
@@ -112,9 +114,54 @@ pub async fn login(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let claims = forge_auth::TokenClaims::new("admin", 30 * 24 * 3600, Some("admin".into()));
+    let role = doc.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+    let claims = forge_auth::TokenClaims::new(&payload.username, 30 * 24 * 3600, Some(role.into()));
     let token = forge_auth::issue_token(&claims, &state.secret_key)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok((StatusCode::OK, Json(LoginRes { token })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserReq {
+    pub username: String,
+    pub password: String,
+}
+
+pub async fn create_user(
+    State(state): State<AppState>,
+    axum::extract::Extension(claims): axum::extract::Extension<forge_auth::TokenClaims>,
+    Json(payload): Json<CreateUserReq>,
+) -> Result<impl IntoResponse, StatusCode> {
+    if claims.role.as_deref() != Some("admin") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let mut salt = [0u8; 16];
+    aws_lc_rs::rand::SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut hash_bytes = [0u8; 32];
+    aws_lc_rs::pbkdf2::derive(
+        aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(100_000).unwrap(),
+        &salt,
+        payload.password.as_bytes(),
+        &mut hash_bytes,
+    );
+
+    let doc = serde_json::json!({
+        "hash": hex::encode(hash_bytes),
+        "salt": hex::encode(salt),
+        "role": "user"
+    });
+    let bytes = rmp_serde::to_vec_named(&doc).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    state
+        .engine
+        .insert("_users", &payload.username, &bytes)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::CREATED)
 }
