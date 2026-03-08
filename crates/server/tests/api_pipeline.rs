@@ -31,7 +31,8 @@ fn test_harness() -> (axum::Router, String, TempDir) {
     let writer = spawn_writer(engine.clone());
 
     let kp = generate_keypair().expect("keypair gen");
-    let public_key = Arc::new(kp.public);
+    let public_key = Arc::new(kp.public.clone());
+    let secret_key = Arc::new(kp.secret.clone());
 
     // Blanket permit — allows everything, which is what we want for happy-path tests.
     let policy = PolicyEngine::new("permit(principal, action, resource);").expect("policy parse");
@@ -41,6 +42,7 @@ fn test_harness() -> (axum::Router, String, TempDir) {
         engine: engine.clone(),
         writer,
         public_key,
+        secret_key,
         policy_engine,
         cursor_signer: std::sync::Arc::new(forge_security::CursorSigner::new(&[0u8; 32])),
     };
@@ -63,6 +65,7 @@ fn deny_harness() -> (axum::Router, String, TempDir) {
 
     let kp = generate_keypair().expect("keypair gen");
     let public_key = Arc::new(kp.public);
+    let secret_key = Arc::new(kp.secret.clone());
 
     // Empty policy set  → deny by default. No permits, no access.
     let policy = PolicyEngine::new("").expect("empty policy");
@@ -72,6 +75,7 @@ fn deny_harness() -> (axum::Router, String, TempDir) {
         engine: engine.clone(),
         writer,
         public_key,
+        secret_key,
         policy_engine,
         cursor_signer: std::sync::Arc::new(forge_security::CursorSigner::new(&[0u8; 32])),
     };

@@ -13,11 +13,12 @@
 use forge_query::policy::PolicyEngine;
 use forge_security::CursorSigner;
 use forge_storage::WriteSender;
-use pasetors::keys::AsymmetricPublicKey;
+use pasetors::keys::{AsymmetricPublicKey, AsymmetricSecretKey};
 use pasetors::version4::V4;
 use std::sync::Arc;
 
 pub mod audit;
+pub mod auth_api;
 pub mod policy;
 
 use axum::{
@@ -67,18 +68,22 @@ pub struct AppState {
     pub engine: Arc<StorageEngine>,
     pub writer: WriteSender,
     pub public_key: Arc<AsymmetricPublicKey<V4>>,
+    pub secret_key: Arc<AsymmetricSecretKey<V4>>,
     pub policy_engine: Arc<PolicyEngine>,
     pub cursor_signer: Arc<CursorSigner>,
 }
 
 /// Builds the master Axum router containing all ForgeDB v1 endpoints.
 pub fn app(state: AppState) -> Router {
-    // Unauthenticated routes — only the health check is truly public.
-    let public_routes = Router::new().route("/_/health", get(health));
+    // Unauthenticated public routes
+    let public = Router::new()
+        .route("/_/health", get(health))
+        .route("/_/auth/status", get(auth_api::auth_status))
+        .route("/_/auth/setup", axum::routing::post(auth_api::setup))
+        .route("/_/auth/login", axum::routing::post(auth_api::login));
 
-    // Authenticated API routes — full middleware pipeline
-    let api_routes = Router::new()
-        // Metadata moved here: requiring auth to prevent reconnaissance.
+    // Authenticated API routes
+    let api = Router::new()
         .route("/_/schema", get(schema_info))
         .route("/v1/{collection}", get(list_docs).post(insert_doc))
         .route(
@@ -94,27 +99,23 @@ pub fn app(state: AppState) -> Router {
             axum::routing::delete(drop_index),
         )
         .route("/v1/_query", axum::routing::post(query_docs))
-        // Everything inside /v1 requires a valid PASETO token.
-        // The middleware parses the Bearer header and rejects bad tokens fast.
-        .route_layer(axum::middleware::from_fn_with_state(
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             policy::require_policy,
         ))
-        // Audit intercepts right after Auth. It yields to Policy and then logs the outcome
-        // (Permit if 200 OK, Deny if Policy kicked it out).
-        .route_layer(axum::middleware::from_fn_with_state(
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             audit::audit_logger,
         ))
-        .route_layer(axum::middleware::from_fn_with_state(
+        .layer(axum::middleware::from_fn_with_state(
             state.public_key.clone(),
             forge_auth::middleware::require_auth,
         ));
 
-    public_routes
-        .merge(api_routes)
+    Router::new()
+        .merge(public)
+        .merge(api)
         .layer(TraceLayer::new_for_http())
-        // Enforce a strict 5MB limit to prevent memory exhaustion attacks.
         .layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024))
         .with_state(state)
 }
@@ -229,25 +230,12 @@ async fn list_docs(
             if state.policy_engine.check_permit(&auth_ctx).is_ok() {
                 valid_docs.push((id.clone(), bytes));
 
-                // VULNERABILITY FIX: ONLY update last_scanned_id if the user is permitted
-                // to see this record, OR if it's the very last record of a full scan.
-                // However, to keep pagination strictly correct and not skip data,
-                // we update it here for permitted records.
                 last_scanned_id = Some(id);
 
                 if valid_docs.len() == limit {
                     break;
                 }
             } else {
-                // If denied, we still need to track that we scanned it so the NEXT
-                // cursor doesn't re-scan it, but we MUST NOT return this ID as a cursor
-                // in a way that implies it exists if the user can't see it?
-                // Actually, for keyset pagination, if we scanned it and denied it,
-                // the cursor should ideally still move past it.
-                // SECURITY TRADE-OFF: We use the ID as a cursor to avoid O(N) re-scans,
-                // but we recognize this leaks the existence of IDs.
-                // We minimize this by only returning the cursor if we have more data or
-                // met the limit.
                 last_scanned_id = Some(id);
             }
         }

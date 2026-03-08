@@ -118,11 +118,11 @@ impl StorageEngine {
         let registry_def = TableDefinition::<&str, &[u8]>::new(crate::index::INDEX_REGISTRY_TABLE);
         if let Ok(reg_table) = txn.open_table(registry_def)
             && let Ok(Some(bytes)) = reg_table.get(collection)
-                && let Ok(registry) =
-                    crate::deserialize_doc::<crate::index::IndexedFields>(bytes.value())
-                {
-                    return registry.fields;
-                }
+            && let Ok(registry) =
+                crate::deserialize_doc::<crate::index::IndexedFields>(bytes.value())
+        {
+            return registry.fields;
+        }
         Vec::new()
     }
 
@@ -146,10 +146,11 @@ impl StorageEngine {
                 let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
                 if let Ok(mut idx_table) = txn.open_table(idx_def) {
                     if let Some(old) = &old_doc
-                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field) {
-                            let key = crate::index::format_index_key(old_val, id);
-                            let _ = idx_table.remove(key.as_slice());
-                        }
+                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field)
+                    {
+                        let key = crate::index::format_index_key(old_val, id);
+                        let _ = idx_table.remove(key.as_slice());
+                    }
                     if let Ok(Some(new_val)) = crate::extract::extract_field_raw(doc, field) {
                         let key = crate::index::format_index_key(new_val, id);
                         let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
@@ -208,10 +209,11 @@ impl StorageEngine {
                     let idx_table_name = crate::index::index_table_name(collection, field);
                     let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
                     if let Ok(mut idx_table) = txn.open_table(idx_def)
-                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(&old, field) {
-                            let key = crate::index::format_index_key(old_val, id);
-                            let _ = idx_table.remove(key.as_slice());
-                        }
+                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(&old, field)
+                    {
+                        let key = crate::index::format_index_key(old_val, id);
+                        let _ = idx_table.remove(key.as_slice());
+                    }
                 }
             }
         }
@@ -268,10 +270,10 @@ impl StorageEngine {
                     if let Ok(mut idx_table) = txn.open_table(idx_def) {
                         if let Some(old) = &old_doc
                             && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field)
-                            {
-                                let key = crate::index::format_index_key(old_val, id);
-                                let _ = idx_table.remove(key.as_slice());
-                            }
+                        {
+                            let key = crate::index::format_index_key(old_val, id);
+                            let _ = idx_table.remove(key.as_slice());
+                        }
                         if let Ok(Some(new_val)) = crate::extract::extract_field_raw(payload, field)
                         {
                             let key = crate::index::format_index_key(new_val, id);
@@ -325,10 +327,10 @@ impl StorageEngine {
                         if let Ok(mut idx_table) = txn.open_table(idx_def)
                             && let Ok(Some(old_val)) =
                                 crate::extract::extract_field_raw(&old, field)
-                            {
-                                let key = crate::index::format_index_key(old_val, id.as_str());
-                                let _ = idx_table.remove(key.as_slice());
-                            }
+                        {
+                            let key = crate::index::format_index_key(old_val, id.as_str());
+                            let _ = idx_table.remove(key.as_slice());
+                        }
                     }
                 }
             }
