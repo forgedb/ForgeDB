@@ -5,6 +5,7 @@
   
   [<img alt="github" src="https://img.shields.io/badge/github-forgedb/ForgeDB-8da0cb?style=for-the-badge&labelColor=555555&logo=github" height="20">](https://github.com/forgedb/ForgeDB)
   [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/forgedb/ForgeDB/rust.yml?branch=main&style=for-the-badge" height="20">](https://github.com/forgedb/ForgeDB/actions)
+  [<img alt="discord" src="https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white" height="20">](https://discord.gg/M5GnktF5ta)
 </div>
 
 <div align="center">
