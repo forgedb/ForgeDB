@@ -2,8 +2,16 @@
 //!
 //! Provides the core Axum [`app`] router which maps HTTP requests to the underlying
 //! [`forge_storage::StorageEngine`]. TLS termination happens upstream in `forge_protocol`.
+//!
+//! The middleware pipeline runs outside-in:
+//! 1. `TraceLayer` — structured request logging (method, URI, status, latency)
+//! 2. `require_auth` — PASETO v4.public token verification
+//! 3. `audit_logger` — outcome tracking in the immutable `_audit` table
+//! 4. `require_policy` — Cedar RLS enforcement
+//! 5. Route handler — the actual storage operation
 
 use forge_query::policy::PolicyEngine;
+use forge_storage::WriteSender;
 use pasetors::keys::AsymmetricPublicKey;
 use pasetors::version4::V4;
 use std::sync::Arc;
@@ -19,21 +27,43 @@ use axum::{
     routing::get,
 };
 use forge_storage::StorageEngine;
+use tower_http::trace::TraceLayer;
+
+/// Maps HTTP verbs to ForgeDB action names for Cedar and audit logging.
+///
+/// Lives here because both `audit.rs` and `policy.rs` need it. We map to the
+/// three actions the Cedar schema actually recognizes: Read, Write, Delete.
+/// POST and PATCH are both "Write" — the schema doesn't distinguish creation
+/// from mutation, and honestly that keeps the policy surface smaller anyway.
+pub fn map_method_to_action(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "Read",
+        axum::http::Method::POST => "Write",
+        axum::http::Method::PATCH | axum::http::Method::PUT => "Write",
+        axum::http::Method::DELETE => "Delete",
+        _ => "Unknown",
+    }
+}
 
 /// Shared application state injected into all route handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<StorageEngine>,
+    pub writer: WriteSender,
     pub public_key: Arc<AsymmetricPublicKey<V4>>,
     pub policy_engine: Arc<PolicyEngine>,
 }
 
 /// Builds the master Axum router containing all ForgeDB v1 endpoints.
 pub fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/v1/:collection", get(list_docs).post(insert_doc))
+    // Unauthenticated routes — health checks, future dashboard assets
+    let public_routes = Router::new().route("/_/health", get(health));
+
+    // Authenticated API routes — full middleware pipeline
+    let api_routes = Router::new()
+        .route("/v1/{collection}", get(list_docs).post(insert_doc))
         .route(
-            "/v1/:collection/:id",
+            "/v1/{collection}/{id}",
             get(get_doc).patch(update_doc).delete(delete_doc),
         )
         // Everything inside /v1 requires a valid PASETO token.
@@ -51,8 +81,20 @@ pub fn app(state: AppState) -> Router {
         .route_layer(axum::middleware::from_fn_with_state(
             state.public_key.clone(),
             forge_auth::middleware::require_auth,
-        ))
+        ));
+
+    public_routes
+        .merge(api_routes)
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// `GET /_/health` — lightweight liveness probe.
+///
+/// Deliberately unauthenticated so load balancers, k8s probes, and the
+/// upcoming Leptos dashboard can reach it without needing a PASETO token.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
 /// GET /v1/:collection
@@ -88,6 +130,9 @@ async fn list_docs(
 /// POST /v1/:collection
 /// Inserts a new document. Body can be JSON or MessagePack.
 /// Converts JSON into MessagePack for storage explicitly based on `Content-Type`.
+///
+/// Routes through the [`WriteSender`] coalescing channel so concurrent POSTs
+/// share a single redbx write transaction instead of each one paying its own fsync.
 async fn insert_doc(
     State(state): State<AppState>,
     Path(collection): Path<String>,
@@ -116,7 +161,9 @@ async fn insert_doc(
 
     let id = uuid::Uuid::new_v4().to_string();
 
-    match state.engine.insert(&collection, &id, &payload_bytes) {
+    // Route through the write-coalescing channel — concurrent inserts
+    // get batched into a single transaction automatically.
+    match state.writer.insert(&collection, &id, payload_bytes).await {
         Ok(_) => Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id })))),
         Err(e) => {
             tracing::error!("insert failed: {e}");

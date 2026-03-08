@@ -1,19 +1,15 @@
+//! Audit logging middleware — tracks every authenticated request outcome.
+//!
+//! Sits between auth and policy in the middleware stack. Runs the inner layers
+//! first, then inspects the response status to figure out whether it was a
+//! Permit or Deny. The entry goes into the immutable `_audit` table — once it's
+//! written, it stays written. No edits, no deletions, no exceptions.
+
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
 use forge_auth::TokenClaims;
 use forge_types::{AuditEntry, Outcome};
 
 use crate::AppState;
-
-/// Maps HTTP verbs to ForgeDB actions for the audit log.
-fn map_http_method_to_action(method: &axum::http::Method) -> &'static str {
-    match *method {
-        axum::http::Method::GET => "Read",
-        axum::http::Method::POST => "Create",
-        axum::http::Method::PATCH | axum::http::Method::PUT => "Update",
-        axum::http::Method::DELETE => "Delete",
-        _ => "Unknown",
-    }
-}
 
 /// Middleware that intercepts requests after authentication to seamlessly
 /// track the outcome of the request in the immutable `_audit` table.
@@ -32,7 +28,7 @@ pub async fn audit_logger(
         .map(|c| c.sub.clone())
         .unwrap_or_else(|| "anonymous".to_string());
 
-    let action = map_http_method_to_action(&method);
+    let action = crate::map_method_to_action(&method);
 
     // Yield to the inner layers (specifically, policy enforcement and core storage APIs)
     let response = next.run(req).await;

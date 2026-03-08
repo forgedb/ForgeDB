@@ -152,10 +152,17 @@ async fn batcher_loop(engine: Arc<StorageEngine>, mut rx: mpsc::Receiver<WriteRe
     }
 }
 
+/// Commits all queued writes in a single redbx transaction — one fsync, not N.
+///
+/// Previous incarnation called `engine.insert()` per document which totally
+/// undermined the whole coalescing concept (each insert was its own txn + fsync).
+/// Now we open ONE write transaction, slam every doc into it, and commit once.
+/// Under 100 concurrent inserts, this is the difference between 100 fsyncs
+/// and exactly 1.
 fn commit_batch(engine: &StorageEngine, batch: &[WriteRequest]) -> Result<()> {
     use std::collections::HashMap;
-    let mut by_collection: HashMap<&str, Vec<(&str, &[u8])>> = HashMap::new();
 
+    let mut by_collection: HashMap<&str, Vec<(&str, &[u8])>> = HashMap::new();
     for req in batch {
         by_collection
             .entry(&req.collection)
@@ -163,14 +170,18 @@ fn commit_batch(engine: &StorageEngine, batch: &[WriteRequest]) -> Result<()> {
             .push((&req.id, &req.payload));
     }
 
-    // Each collection's documents are written sequentially inside the same task.
-    // Concurrent callers are already coalesced by the mpsc channel — there's no
-    // head-of-line blocking on the HTTP side, just an ordered queue here.
+    let db = engine.raw_db();
+    let txn = db.begin_write().map_err(redbx::Error::from)?;
+
     for (collection, docs) in by_collection {
-        for (id, payload) in &docs {
-            engine.insert(collection, id, payload)?;
+        let table_def: redbx::TableDefinition<&str, &[u8]> =
+            redbx::TableDefinition::new(collection);
+        let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+        for (id, payload) in docs {
+            table.insert(id, payload).map_err(redbx::Error::from)?;
         }
     }
 
+    txn.commit().map_err(redbx::Error::from)?;
     Ok(())
 }

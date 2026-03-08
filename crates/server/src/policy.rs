@@ -1,3 +1,11 @@
+//! Cedar policy enforcement middleware — the authorization checkpoint.
+//!
+//! This runs *after* the PASETO auth middleware has verified identity. It takes
+//! the verified claims, maps the HTTP method to one of our three Cedar actions
+//! (Read, Write, Delete), builds a Cedar request, and checks it against the
+//! loaded policy set. No permit? No access. A single `forbid` overrides
+//! everything — that's the whole point.
+
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -9,17 +17,6 @@ use forge_auth::TokenClaims;
 use forge_query::context::AuthContext;
 
 use crate::AppState;
-
-/// Maps HTTP verbs to ForgeDB actions for Cedar evaluation.
-fn map_http_method_to_action(method: &axum::http::Method) -> &'static str {
-    match *method {
-        axum::http::Method::GET => "Read",
-        axum::http::Method::POST => "Create",
-        axum::http::Method::PATCH | axum::http::Method::PUT => "Update",
-        axum::http::Method::DELETE => "Delete",
-        _ => "Unknown",
-    }
-}
 
 /// Middleware to enforce Cedar Row-Level Security explicitly.
 ///
@@ -37,7 +34,7 @@ pub async fn require_policy(
     })?;
 
     let principal = &claims.sub;
-    let action = map_http_method_to_action(req.method());
+    let action = crate::map_method_to_action(req.method());
 
     let uri = req.uri().path();
     let parts: Vec<&str> = uri.trim_matches('/').split('/').collect();
