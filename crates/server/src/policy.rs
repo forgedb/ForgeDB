@@ -44,6 +44,9 @@ pub async fn require_policy(
     // Convert paths like "/v1/users/123" -> "users/123"
     // Keep internal system paths like "/_/schema" as is (relative to root)
     let resource = match normalized_path.as_slice() {
+        ["v1", "_query"] => return Ok(next.run(req).await),
+        ["v1", "_indexes", collection] => collection.to_string(),
+        ["v1", "_indexes", collection, _] => collection.to_string(),
         ["v1", collection] => collection.to_string(),
         ["v1", collection, id] => format!("{collection}/{id}"),
         path => path.join("/"),
