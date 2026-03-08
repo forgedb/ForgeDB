@@ -9,9 +9,12 @@
 pub mod audit;
 pub mod document;
 pub mod engine;
+pub mod extract;
+pub mod index;
 pub mod writer;
 
 pub use audit::AuditLog;
 pub use document::{deserialize_doc, serialize_doc};
 pub use engine::{StorageConfig, StorageEngine};
+pub use index::{IndexRegistry, format_index_key, index_table_name};
 pub use writer::{WriteSender, spawn_writer};
