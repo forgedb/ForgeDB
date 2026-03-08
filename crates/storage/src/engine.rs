@@ -112,13 +112,52 @@ impl StorageEngine {
         Ok(Self { db })
     }
 
+    /// Helper to fetch indexed fields for a collection within an active write transaction.
+    /// This avoids reopening the table for every document in a batch.
+    fn get_indexed_fields(txn: &redbx::WriteTransaction, collection: &str) -> Vec<String> {
+        let registry_def = TableDefinition::<&str, &[u8]>::new(crate::index::INDEX_REGISTRY_TABLE);
+        if let Ok(reg_table) = txn.open_table(registry_def)
+            && let Ok(Some(bytes)) = reg_table.get(collection)
+                && let Ok(registry) =
+                    crate::deserialize_doc::<crate::index::IndexedFields>(bytes.value())
+                {
+                    return registry.fields;
+                }
+        Vec::new()
+    }
+
     /// Insert a document into a collection. Overwrites if the key already exists.
     ///
     /// One write transaction per call — fully durable on return.
     /// For bulk imports, use [`insert_batch`] instead.
     pub fn insert(&self, collection: &str, id: &str, doc: &[u8]) -> Result<()> {
-        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let table_def = TableDefinition::<&str, &[u8]>::new(collection);
         let txn = self.db.begin_write().map_err(redbx::Error::from)?;
+
+        let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        if !indexed_fields.is_empty() {
+            let old_doc = {
+                let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+                table.get(id).ok().flatten().map(|b| b.value().to_vec())
+            };
+
+            for field in &indexed_fields {
+                let idx_table_name = crate::index::index_table_name(collection, field);
+                let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+                if let Ok(mut idx_table) = txn.open_table(idx_def) {
+                    if let Some(old) = &old_doc
+                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field) {
+                            let key = crate::index::format_index_key(old_val, id);
+                            let _ = idx_table.remove(key.as_slice());
+                        }
+                    if let Ok(Some(new_val)) = crate::extract::extract_field_raw(doc, field) {
+                        let key = crate::index::format_index_key(new_val, id);
+                        let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
+                    }
+                }
+            }
+        }
+
         {
             let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
             table.insert(id, doc).map_err(redbx::Error::from)?;
@@ -153,12 +192,38 @@ impl StorageEngine {
 
     /// Delete a document by ID. Returns `true` if the key existed.
     pub fn delete(&self, collection: &str, id: &str) -> Result<bool> {
-        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let table_def = TableDefinition::<&str, &[u8]>::new(collection);
         let txn = self.db.begin_write().map_err(redbx::Error::from)?;
-        let existed = {
+        let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        let mut existed = false;
+
+        if !indexed_fields.is_empty() {
+            let old_doc = {
+                let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+                table.get(id).ok().flatten().map(|b| b.value().to_vec())
+            };
+            if let Some(old) = old_doc {
+                existed = true;
+                for field in &indexed_fields {
+                    let idx_table_name = crate::index::index_table_name(collection, field);
+                    let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+                    if let Ok(mut idx_table) = txn.open_table(idx_def)
+                        && let Ok(Some(old_val)) = crate::extract::extract_field_raw(&old, field) {
+                            let key = crate::index::format_index_key(old_val, id);
+                            let _ = idx_table.remove(key.as_slice());
+                        }
+                }
+            }
+        }
+
+        {
             let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
-            table.remove(id).map_err(redbx::Error::from)?.is_some()
-        };
+            if !existed {
+                existed = table.remove(id).map_err(redbx::Error::from)?.is_some();
+            } else {
+                let _ = table.remove(id).map_err(redbx::Error::from)?;
+            }
+        }
         txn.commit().map_err(redbx::Error::from)?;
         Ok(existed)
     }
@@ -182,11 +247,39 @@ impl StorageEngine {
         docs: &[(&str, &[u8])],
         flush: bool,
     ) -> Result<()> {
-        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let table_def = TableDefinition::<&str, &[u8]>::new(collection);
         let mut txn = self.db.begin_write().map_err(redbx::Error::from)?;
 
         if !flush {
             let _ = txn.set_durability(Durability::None);
+        }
+
+        let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        for &(id, payload) in docs {
+            if !indexed_fields.is_empty() {
+                let old_doc = {
+                    let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+                    table.get(id).ok().flatten().map(|b| b.value().to_vec())
+                };
+
+                for field in &indexed_fields {
+                    let idx_table_name = crate::index::index_table_name(collection, field);
+                    let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+                    if let Ok(mut idx_table) = txn.open_table(idx_def) {
+                        if let Some(old) = &old_doc
+                            && let Ok(Some(old_val)) = crate::extract::extract_field_raw(old, field)
+                            {
+                                let key = crate::index::format_index_key(old_val, id);
+                                let _ = idx_table.remove(key.as_slice());
+                            }
+                        if let Ok(Some(new_val)) = crate::extract::extract_field_raw(payload, field)
+                        {
+                            let key = crate::index::format_index_key(new_val, id);
+                            let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
+                        }
+                    }
+                }
+            }
         }
 
         {
@@ -207,11 +300,38 @@ impl StorageEngine {
     ///
     /// Returns [`ForgeError::Storage`] if the transaction or any individual removal fails.
     pub fn delete_batch(&self, collection: &str, ids: &[String], flush: bool) -> Result<()> {
-        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let table_def = TableDefinition::<&str, &[u8]>::new(collection);
         let mut txn = self.db.begin_write().map_err(redbx::Error::from)?;
 
         if !flush {
             let _ = txn.set_durability(Durability::None);
+        }
+
+        let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        for id in ids {
+            if !indexed_fields.is_empty() {
+                let old_doc = {
+                    let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
+                    table
+                        .get(id.as_str())
+                        .ok()
+                        .flatten()
+                        .map(|b| b.value().to_vec())
+                };
+                if let Some(old) = old_doc {
+                    for field in &indexed_fields {
+                        let idx_table_name = crate::index::index_table_name(collection, field);
+                        let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+                        if let Ok(mut idx_table) = txn.open_table(idx_def)
+                            && let Ok(Some(old_val)) =
+                                crate::extract::extract_field_raw(&old, field)
+                            {
+                                let key = crate::index::format_index_key(old_val, id.as_str());
+                                let _ = idx_table.remove(key.as_slice());
+                            }
+                    }
+                }
+            }
         }
 
         {
@@ -222,6 +342,137 @@ impl StorageEngine {
         }
         txn.commit().map_err(redbx::Error::from)?;
         Ok(())
+    }
+
+    /// Creates a new secondary index for a collection and backfills existing documents.
+    pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
+        let registry = crate::index::IndexRegistry::new(&self.db);
+        registry.create_index(collection, field)?;
+
+        let table_def = TableDefinition::<&str, &[u8]>::new(collection);
+        let idx_table_name = crate::index::index_table_name(collection, field);
+        let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+
+        let txn = self.db.begin_write().map_err(redbx::Error::from)?;
+        {
+            if let Ok(table) = txn.open_table(table_def) {
+                let mut idx_table = txn.open_table(idx_def).map_err(redbx::Error::from)?;
+                let iter = table.iter().map_err(redbx::Error::from)?;
+                for entry in iter {
+                    let (k, v) = entry.map_err(redbx::Error::from)?;
+                    let doc_id = k.value();
+                    let payload = v.value();
+
+                    if let Ok(Some(val)) = crate::extract::extract_field_raw(payload, field) {
+                        let key = crate::index::format_index_key(val, doc_id);
+                        let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
+                    }
+                }
+            }
+        }
+        txn.commit().map_err(redbx::Error::from)?;
+        Ok(())
+    }
+
+    /// Drops a secondary index and clears its backing table.
+    pub fn drop_index(&self, collection: &str, field: &str) -> Result<()> {
+        let registry = crate::index::IndexRegistry::new(&self.db);
+        registry.drop_index(collection, field)?;
+
+        let idx_table_name = crate::index::index_table_name(collection, field);
+        let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+
+        let txn = self.db.begin_write().map_err(redbx::Error::from)?;
+        {
+            if let Ok(mut idx_table) = txn.open_table(idx_def) {
+                let mut keys = Vec::new();
+                if let Ok(iter) = idx_table.iter() {
+                    for (k, _) in iter.flatten() {
+                        keys.push(k.value().to_vec());
+                    }
+                }
+                for k in keys {
+                    let _ = idx_table.remove(k.as_slice());
+                }
+            }
+        }
+        txn.commit().map_err(redbx::Error::from)?;
+        Ok(())
+    }
+
+    /// Look up documents using a secondary index, with pagination.
+    pub fn lookup_by_index(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &[u8],
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<PaginatedList> {
+        let idx_table_name = crate::index::index_table_name(collection, field);
+        let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+        let coll_def = TableDefinition::<&str, &[u8]>::new(collection);
+
+        let txn = self.db.begin_read().map_err(redbx::Error::from)?;
+
+        let idx_table = match txn.open_table(idx_def) {
+            Ok(t) => t,
+            Err(_) => return Ok((Vec::new(), None)),
+        };
+        let coll_table = match txn.open_table(coll_def) {
+            Ok(t) => t,
+            Err(_) => return Ok((Vec::new(), None)),
+        };
+
+        let mut prefix = Vec::with_capacity(value.len() + 1);
+        prefix.extend_from_slice(value);
+        prefix.push(0);
+
+        let mut results = Vec::with_capacity(limit + 1);
+        let mut next_cursor = None;
+
+        let cursor_key;
+        let start_bound = if let Some(c) = cursor {
+            cursor_key = crate::index::format_index_key(value, c);
+            std::ops::Bound::Excluded(cursor_key.as_slice())
+        } else {
+            std::ops::Bound::Included(prefix.as_slice())
+        };
+
+        let iter = idx_table
+            .range::<&[u8]>((start_bound, std::ops::Bound::Unbounded))
+            .map_err(redbx::Error::from)?;
+
+        for entry in iter {
+            let (k, _) = entry.map_err(redbx::Error::from)?;
+            let key_bytes = k.value();
+
+            if !key_bytes.starts_with(&prefix) {
+                break;
+            }
+
+            let doc_id_bytes = &key_bytes[prefix.len()..];
+            let id = std::str::from_utf8(doc_id_bytes).map_err(|e| {
+                ForgeError::Storage(redbx::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e,
+                )))
+            })?;
+
+            if let Ok(Some(doc_bytes)) = coll_table.get(id) {
+                results.push((id.to_string(), Bytes::copy_from_slice(doc_bytes.value())));
+                if results.len() > limit {
+                    break;
+                }
+            }
+        }
+
+        if results.len() > limit {
+            results.pop();
+            next_cursor = results.last().map(|(k, _)| k.clone());
+        }
+
+        Ok((results, next_cursor))
     }
 
     /// Force a durable flush to disk. Use after a sequence of non-flushing batch operations.
@@ -343,10 +594,10 @@ impl StorageEngine {
         patch: &[u8],
         merge_fn: impl Fn(&[u8], &[u8]) -> Result<Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
+        let table_def = TableDefinition::<&str, &[u8]>::new(collection);
         let txn = self.db.begin_write().map_err(redbx::Error::from)?;
 
-        let merged = {
+        let (existing_bytes, merged) = {
             let table = txn.open_table(table_def).map_err(redbx::Error::from)?;
 
             let existing = table.get(id).map_err(redbx::Error::from)?.ok_or_else(|| {
@@ -356,8 +607,30 @@ impl StorageEngine {
                 )))
             })?;
 
-            merge_fn(existing.value(), patch)?
+            let existing_bytes = existing.value().to_vec();
+            let merged = merge_fn(&existing_bytes, patch)?;
+            (existing_bytes, merged)
         };
+
+        let indexed_fields = Self::get_indexed_fields(&txn, collection);
+        if !indexed_fields.is_empty() {
+            for field in &indexed_fields {
+                let idx_table_name = crate::index::index_table_name(collection, field);
+                let idx_def = TableDefinition::<&[u8], &[u8]>::new(&idx_table_name);
+                if let Ok(mut idx_table) = txn.open_table(idx_def) {
+                    if let Ok(Some(old_val)) =
+                        crate::extract::extract_field_raw(&existing_bytes, field)
+                    {
+                        let key = crate::index::format_index_key(old_val, id);
+                        let _ = idx_table.remove(key.as_slice());
+                    }
+                    if let Ok(Some(new_val)) = crate::extract::extract_field_raw(&merged, field) {
+                        let key = crate::index::format_index_key(new_val, id);
+                        let _ = idx_table.insert(key.as_slice(), &[] as &[u8]);
+                    }
+                }
+            }
+        }
 
         // We re-open the table block to bypass borrow-checker holding `existing`
         {
@@ -427,6 +700,64 @@ mod tests {
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0], ("a".into(), Bytes::from_static(b"one")));
         assert_eq!(docs[1], ("b".into(), Bytes::from_static(b"two")));
+    }
+
+    #[test]
+    fn secondary_indexes_maintain_sync_and_query() {
+        let (engine, _tmp) = test_engine();
+
+        // 1. Insert documents before index exists
+        let doc1 =
+            rmp_serde::to_vec_named(&serde_json::json!({"name": "Alice", "age": 30})).unwrap();
+        let doc2 = rmp_serde::to_vec_named(&serde_json::json!({"name": "Bob", "age": 30})).unwrap();
+        let doc3 =
+            rmp_serde::to_vec_named(&serde_json::json!({"name": "Charlie", "age": 25})).unwrap();
+
+        engine.insert("users", "u1", &doc1).unwrap();
+        engine.insert("users", "u2", &doc2).unwrap();
+        engine.insert("users", "u3", &doc3).unwrap();
+
+        // 2. Create index on "age". This should backfill.
+        engine.create_index("users", "age").unwrap();
+
+        let age_30_msgpack = rmp_serde::to_vec_named(&30).unwrap();
+        let (res, _) = engine
+            .lookup_by_index("users", "age", &age_30_msgpack, None, 10)
+            .unwrap();
+        assert_eq!(res.len(), 2);
+
+        // 3. Insert after index exists
+        let doc4 =
+            rmp_serde::to_vec_named(&serde_json::json!({"name": "Dave", "age": 30})).unwrap();
+        engine.insert("users", "u4", &doc4).unwrap();
+
+        let (res, _) = engine
+            .lookup_by_index("users", "age", &age_30_msgpack, None, 10)
+            .unwrap();
+        assert_eq!(res.len(), 3);
+
+        // 4. Update document (change age 30 -> 25)
+        engine
+            .update_doc("users", "u1", &[], |_, _| Ok(doc3.clone()))
+            .unwrap(); // u1 now has age 25
+
+        let (res, _) = engine
+            .lookup_by_index("users", "age", &age_30_msgpack, None, 10)
+            .unwrap();
+        assert_eq!(res.len(), 2); // u2, u4
+
+        let age_25_msgpack = rmp_serde::to_vec_named(&25).unwrap();
+        let (res, _) = engine
+            .lookup_by_index("users", "age", &age_25_msgpack, None, 10)
+            .unwrap();
+        assert_eq!(res.len(), 2); // u3, u1
+
+        // 5. Delete document
+        engine.delete("users", "u2").unwrap();
+        let (res, _) = engine
+            .lookup_by_index("users", "age", &age_30_msgpack, None, 10)
+            .unwrap();
+        assert_eq!(res.len(), 1); // only u4 left
     }
 
     #[test]

@@ -13,6 +13,9 @@ pub struct PaginationParams {
     pub cursor: Option<String>,
     /// Maximum number of items to return. Defaults to 50 if missing.
     pub limit: Option<u32>,
+    /// Catch-all for extra query parameters (like `where[field]=value`).
+    #[serde(flatten)]
+    pub query_filters: std::collections::HashMap<String, String>,
 }
 
 impl Default for PaginationParams {
@@ -20,6 +23,7 @@ impl Default for PaginationParams {
         Self {
             cursor: None,
             limit: Some(50),
+            query_filters: std::collections::HashMap::new(),
         }
     }
 }
@@ -59,18 +63,21 @@ mod tests {
         let over = PaginationParams {
             cursor: None,
             limit: Some(5000),
+            query_filters: std::collections::HashMap::new(),
         };
         assert_eq!(over.resolved_limit(), 1000);
 
         let under = PaginationParams {
             cursor: None,
             limit: Some(0),
+            query_filters: std::collections::HashMap::new(),
         };
         assert_eq!(under.resolved_limit(), 1);
 
         let fine = PaginationParams {
             cursor: None,
             limit: Some(150),
+            query_filters: std::collections::HashMap::new(),
         };
         assert_eq!(fine.resolved_limit(), 150);
     }

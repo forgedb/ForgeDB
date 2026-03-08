@@ -819,8 +819,10 @@ dependencies = [
  "bytes",
  "forge-types",
  "redbx",
+ "rmp",
  "rmp-serde",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -833,6 +835,7 @@ version = "0.2.0"
 dependencies = [
  "redbx",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "toml",
  "uuid",
