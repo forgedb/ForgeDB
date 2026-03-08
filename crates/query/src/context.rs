@@ -26,6 +26,16 @@ pub struct AuthContext {
     pub resource: String,
 }
 
+/// Escapes a string for use as a Cedar entity ID within double quotes.
+///
+/// Prevents "Cedar injection" by ensuring that characters like double quotes
+/// or backslashes can't be used to break out of the string literal and
+/// inject additional policy logic.
+fn cedar_escape(raw: &str) -> String {
+    // Cedar uses standard C-style escaping for strings.
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 impl AuthContext {
     /// Creates a new AuthContext.
     pub fn new(
@@ -48,9 +58,9 @@ impl AuthContext {
     /// strings can't be wrangled into valid Cedar `EntityUid`s. For instance,
     /// if some client sends over malicious characters that Cedar outright rejects in entity IDs.
     pub fn to_cedar_request(&self) -> Result<Request> {
-        let principal_eid = format!(r#"ForgeDB::User::"{}""#, self.principal);
-        let action_eid = format!(r#"ForgeDB::Action::"{}""#, self.action);
-        let resource_eid = format!(r#"ForgeDB::Document::"{}""#, self.resource);
+        let principal_eid = format!(r#"ForgeDB::User::"{}""#, cedar_escape(&self.principal));
+        let action_eid = format!(r#"ForgeDB::Action::"{}""#, cedar_escape(&self.action));
+        let resource_eid = format!(r#"ForgeDB::Document::"{}""#, cedar_escape(&self.resource));
 
         let p_uid: EntityUid = principal_eid
             .parse()
@@ -103,5 +113,21 @@ mod tests {
         let ctx = AuthContext::new("user_name@domain.com", "Write", "a/b/c/d");
         let req = ctx.to_cedar_request().unwrap();
         assert!(req.principal().is_some());
+    }
+
+    #[test]
+    fn cedar_injection_attempt_is_escaped() {
+        // Attempting to inject a bypass: "principal,action,resource); //"
+        let malicious = r#"alice", action, resource); //"#;
+        let ctx = AuthContext::new(malicious, "Read", "docs/1");
+        let req = ctx
+            .to_cedar_request()
+            .expect("Escaping should make this a valid, if weird, ID");
+
+        // The key check: Is the principal still exactly what we passed, but quoted?
+        // Cedar .to_string() will show the escaped version.
+        let p_str = req.principal().unwrap().to_string();
+        assert!(p_str.contains(r#"alice\", action, resource); //"#));
+        assert!(p_str.starts_with(r#"ForgeDB::User::"#));
     }
 }

@@ -37,14 +37,16 @@ pub async fn require_policy(
     let action = crate::map_method_to_action(req.method());
 
     let uri = req.uri().path();
-    let parts: Vec<&str> = uri.trim_matches('/').split('/').collect();
+
+    // Normalize: remove duplicate slashes and trim trailing slash
+    let normalized_path = uri.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>();
 
     // Convert paths like "/v1/users/123" -> "users/123"
-    // Or "/v1/users" -> "users"
-    let resource = match parts.as_slice() {
+    // Keep internal system paths like "/_/schema" as is (relative to root)
+    let resource = match normalized_path.as_slice() {
         ["v1", collection] => collection.to_string(),
         ["v1", collection, id] => format!("{collection}/{id}"),
-        _ => uri.to_string(),
+        path => path.join("/"),
     };
 
     let auth_ctx = AuthContext::new(principal, action, &resource);

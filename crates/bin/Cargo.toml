@@ -21,6 +21,7 @@ forge-auth = { workspace = true }
 forge-query = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+aws-lc-rs = { workspace = true }
 pasetors = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }

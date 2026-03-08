@@ -131,11 +131,19 @@ fn cmd_serve(config_path: PathBuf) -> forge_types::Result<()> {
             config.bind_address
         );
 
+        // Derive a 32-byte cursor signing key from the master password.
+        let cursor_key_hash =
+            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, password.as_bytes());
+        let mut cursor_key = [0u8; 32];
+        cursor_key.copy_from_slice(cursor_key_hash.as_ref());
+        let cursor_signer = std::sync::Arc::new(forge_security::CursorSigner::new(&cursor_key));
+
         let app_state = forge_server::AppState {
             engine: engine.clone(),
             writer,
             public_key: public_key.clone(),
             policy_engine: policy_engine.clone(),
+            cursor_signer,
         };
         let app = forge_server::app(app_state);
 
