@@ -151,12 +151,14 @@ async fn valid_token_with_deny_policy_returns_403() {
 async fn insert_and_retrieve_document() {
     let (app, token, _tmp) = test_harness();
 
-    // POST a JSON document
+    // POST a JSON document. Must explicitly ask for JSON back, otherwise
+    // the v0.3 API defaults to returning MessagePack and `serde_json::from_slice` below panics.
     let insert_req = Request::builder()
         .method("POST")
         .uri("/v1/items")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json")
         .body(Body::from(r#"{"name":"test","value":42}"#))
         .unwrap();
 

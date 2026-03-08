@@ -176,12 +176,13 @@ impl StorageEngine {
 
     /// Insert many documents in a single write transaction — one fsync, not N.
     ///
-    /// The same `value` bytes are written under every `id` in this version. A proper
-    /// bulk API taking `&[(id, bytes)]` pairs lands in v0.3 with the MessagePack layer.
+    /// Each tuple is `(doc_id, raw_bytes)`. Prior to v0.3 this took a single value
+    /// for all IDs, which was a stopgap that nobody liked — now every document gets
+    /// its own payload like a civilized database.
     ///
     /// Set `flush` to `false` for intermediate batches in a larger import sequence;
-    /// call [`flush`] afterward. Leave it `true` for safety unless you know exactly
-    /// what you're doing.
+    /// call [`flush`] afterward. Leave it `true` for safety unless you're orchestrating
+    /// a multi-step bulk load and genuinely know the crash-recovery implications.
     ///
     /// # Errors
     ///
@@ -189,8 +190,7 @@ impl StorageEngine {
     pub fn insert_batch(
         &self,
         collection: &str,
-        ids: &[String],
-        value: &[u8],
+        docs: &[(&str, &[u8])],
         flush: bool,
     ) -> Result<()> {
         let table_def: TableDefinition<&str, &[u8]> = TableDefinition::new(collection);
@@ -202,10 +202,8 @@ impl StorageEngine {
 
         {
             let mut table = txn.open_table(table_def).map_err(redbx::Error::from)?;
-            for id in ids {
-                table
-                    .insert(id.as_str(), value)
-                    .map_err(redbx::Error::from)?;
+            for (id, payload) in docs {
+                table.insert(*id, *payload).map_err(redbx::Error::from)?;
             }
         }
         txn.commit().map_err(redbx::Error::from)?;
@@ -378,10 +376,16 @@ mod tests {
     #[test]
     fn insert_batch_then_read() {
         let (engine, _tmp) = test_engine();
-        let ids: Vec<String> = (0..100).map(|i| format!("doc-{i}")).collect();
-        engine.insert_batch("test", &ids, b"payload", true).unwrap();
+        let docs: Vec<(String, Vec<u8>)> = (0..100)
+            .map(|i| (format!("doc-{i}"), b"payload".to_vec()))
+            .collect();
+        let doc_refs: Vec<(&str, &[u8])> = docs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_slice()))
+            .collect();
+        engine.insert_batch("test", &doc_refs, true).unwrap();
 
-        for id in &ids {
+        for (id, _) in &docs {
             assert_eq!(
                 engine.get("test", id).unwrap(),
                 Some(Bytes::from_static(b"payload"))
@@ -390,10 +394,34 @@ mod tests {
     }
 
     #[test]
+    fn insert_batch_per_doc_payloads() {
+        let (engine, _tmp) = test_engine();
+        let docs: Vec<(&str, &[u8])> = vec![("a", b"alpha"), ("b", b"bravo"), ("c", b"charlie")];
+        engine.insert_batch("mixed", &docs, true).unwrap();
+
+        assert_eq!(
+            engine.get("mixed", "a").unwrap(),
+            Some(Bytes::from_static(b"alpha"))
+        );
+        assert_eq!(
+            engine.get("mixed", "b").unwrap(),
+            Some(Bytes::from_static(b"bravo"))
+        );
+        assert_eq!(
+            engine.get("mixed", "c").unwrap(),
+            Some(Bytes::from_static(b"charlie"))
+        );
+    }
+
+    #[test]
     fn delete_batch_removes_all() {
         let (engine, _tmp) = test_engine();
         let ids: Vec<String> = (0..50).map(|i| format!("doc-{i}")).collect();
-        engine.insert_batch("test", &ids, b"data", true).unwrap();
+        let docs: Vec<(&str, &[u8])> = ids
+            .iter()
+            .map(|id| (id.as_str(), b"data" as &[u8]))
+            .collect();
+        engine.insert_batch("test", &docs, true).unwrap();
         engine.delete_batch("test", &ids, true).unwrap();
 
         for id in &ids {
@@ -404,11 +432,9 @@ mod tests {
     #[test]
     fn non_flush_batch_readable_before_flush() {
         let (engine, _tmp) = test_engine();
-        let ids: Vec<String> = vec!["a".into(), "b".into()];
+        let docs: Vec<(&str, &[u8])> = vec![("a", b"lazy-write"), ("b", b"lazy-write")];
         // Durability::None — in memory only until flush()
-        engine
-            .insert_batch("lazy", &ids, b"lazy-write", false)
-            .unwrap();
+        engine.insert_batch("lazy", &docs, false).unwrap();
         // Should still be readable within the same process (it's in the page cache)
         assert!(engine.get("lazy", "a").unwrap().is_some());
         // Flush to disk explicitly

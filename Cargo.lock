@@ -770,6 +770,7 @@ version = "0.2.0"
 dependencies = [
  "cedar-policy",
  "forge-types",
+ "serde",
  "serde_json",
 ]
 
