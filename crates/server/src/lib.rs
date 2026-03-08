@@ -131,10 +131,11 @@ async fn list_docs(
     State(state): State<AppState>,
     Path(collection): Path<String>,
     axum::extract::Query(params): axum::extract::Query<forge_types::pagination::PaginationParams>,
+    axum::extract::Extension(claims): axum::extract::Extension<forge_auth::TokenClaims>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     let limit = params.limit.unwrap_or(50).clamp(1, 100) as usize;
-    let cursor = params.cursor.as_deref();
+    let mut current_cursor = params.cursor.clone();
 
     let mut where_filter = None;
     for (k, v) in &params.query_filters {
@@ -145,87 +146,138 @@ async fn list_docs(
         }
     }
 
-    let query_result = match where_filter {
-        Some((field, val_str)) => {
-            let msgpack_val = match serde_json::from_str::<serde_json::Value>(val_str) {
-                Ok(j) => forge_storage::document::serialize_doc(&j).unwrap_or_default(),
-                Err(_) => forge_storage::document::serialize_doc(&serde_json::Value::String(
-                    val_str.to_string(),
-                ))
-                .unwrap_or_default(),
-            };
-            state
-                .engine
-                .lookup_by_index(&collection, field, &msgpack_val, cursor, limit)
-        }
-        None => state.engine.list_paginated(&collection, cursor, limit),
+    let msgpack_val = if let Some((_, val_str)) = where_filter {
+        let v = match serde_json::from_str::<serde_json::Value>(val_str) {
+            Ok(j) => forge_storage::document::serialize_doc(&j).unwrap_or_default(),
+            Err(_) => forge_storage::document::serialize_doc(&serde_json::Value::String(
+                val_str.to_string(),
+            ))
+            .unwrap_or_default(),
+        };
+        Some(v)
+    } else {
+        None
     };
 
-    match query_result {
-        Ok((docs, next_cursor)) => {
-            let accept = headers
-                .get(axum::http::header::ACCEPT)
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("");
+    let principal = &claims.sub;
+    let action = "Read";
 
-            if accept.contains("application/json") {
-                let json_docs: Vec<serde_json::Value> = docs
-                    .into_iter()
-                    .map(|(id, bytes)| {
-                        let doc: serde_json::Value =
-                            rmp_serde::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-                        serde_json::json!({ "id": id, "doc": doc })
-                    })
-                    .collect();
+    let mut valid_docs = Vec::new();
+    let mut total_scanned = 0;
+    const MAX_SCAN_LIMIT: usize = 1000;
+    let mut last_scanned_id = None;
 
-                let has_more = next_cursor.is_some();
-                let response = forge_types::pagination::PaginatedResponse {
-                    data: json_docs,
-                    next_cursor: next_cursor.clone(),
-                    has_more,
-                };
+    while valid_docs.len() < limit && total_scanned < MAX_SCAN_LIMIT {
+        let fetch_limit = std::cmp::min(MAX_SCAN_LIMIT - total_scanned, limit);
 
-                Ok((
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    serde_json::to_vec(&response).unwrap_or_default(),
-                )
-                    .into_response())
-            } else {
-                // For MessagePack, we deserialize the internal payload, wrap it,
-                // and pack it into a structured array inside a PaginatedResponse.
-                let mut wrapper = Vec::with_capacity(docs.len());
-                for (id, bytes) in docs {
-                    if let Ok(val) = rmp_serde::from_slice::<serde_json::Value>(&bytes) {
-                        wrapper.push(serde_json::json!({ "id": id, "doc": val }));
-                    }
-                }
-
-                let has_more = next_cursor.is_some();
-                let response = forge_types::pagination::PaginatedResponse {
-                    data: wrapper,
-                    next_cursor,
-                    has_more,
-                };
-
-                let resp_bytes =
-                    forge_storage::document::serialize_doc_named(&response).map_err(|e| {
-                        tracing::error!("failed to serialize paginated list to msgpack: {e}");
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-
-                Ok((
-                    StatusCode::OK,
-                    [(axum::http::header::CONTENT_TYPE, "application/msgpack")],
-                    resp_bytes,
-                )
-                    .into_response())
+        let query_result = match where_filter {
+            Some((field, _)) => state.engine.lookup_by_index(
+                &collection,
+                field,
+                msgpack_val.as_ref().unwrap(),
+                current_cursor.as_deref(),
+                fetch_limit,
+            ),
+            None => {
+                state
+                    .engine
+                    .list_paginated(&collection, current_cursor.as_deref(), fetch_limit)
             }
         }
-        Err(e) => {
+        .map_err(|e| {
             tracing::error!("list_paginated failed: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let (docs, next_cursor) = query_result;
+        let fetched_len = docs.len();
+
+        if fetched_len == 0 {
+            break;
         }
+
+        total_scanned += fetched_len;
+
+        for (id, bytes) in docs {
+            let resource = format!("{}/{}", collection, id);
+            let auth_ctx = forge_query::context::AuthContext::new(principal, action, &resource);
+
+            if state.policy_engine.check_permit(&auth_ctx).is_ok() {
+                valid_docs.push((id.clone(), bytes));
+                if valid_docs.len() == limit {
+                    last_scanned_id = Some(id);
+                    break;
+                }
+            }
+            last_scanned_id = Some(id);
+        }
+
+        current_cursor = next_cursor.clone();
+        if next_cursor.is_none() {
+            break;
+        }
+    }
+
+    let next_cursor = if valid_docs.len() == limit || current_cursor.is_some() {
+        last_scanned_id.or(current_cursor)
+    } else {
+        None
+    };
+
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    if accept.contains("application/json") {
+        let json_docs: Vec<serde_json::Value> = valid_docs
+            .into_iter()
+            .map(|(id, bytes)| {
+                let doc: serde_json::Value =
+                    rmp_serde::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                serde_json::json!({ "id": id, "doc": doc })
+            })
+            .collect();
+
+        let has_more = next_cursor.is_some();
+        let response = forge_types::pagination::PaginatedResponse {
+            data: json_docs,
+            next_cursor: next_cursor.clone(),
+            has_more,
+        };
+
+        Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_vec(&response).unwrap_or_default(),
+        )
+            .into_response())
+    } else {
+        let mut wrapper = Vec::with_capacity(valid_docs.len());
+        for (id, bytes) in valid_docs {
+            if let Ok(val) = rmp_serde::from_slice::<serde_json::Value>(&bytes) {
+                wrapper.push(serde_json::json!({ "id": id, "doc": val }));
+            }
+        }
+
+        let has_more = next_cursor.is_some();
+        let response = forge_types::pagination::PaginatedResponse {
+            data: wrapper,
+            next_cursor,
+            has_more,
+        };
+
+        let resp_bytes = forge_storage::document::serialize_doc_named(&response).map_err(|e| {
+            tracing::error!("failed to serialize paginated list to msgpack: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        Ok((
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/msgpack")],
+            resp_bytes,
+        )
+            .into_response())
     }
 }
 
@@ -368,10 +420,18 @@ async fn get_doc(
 /// Helper function to execute local BFS N+1 joins directly on the B-Tree memory maps.
 fn process_joins(
     engine: &forge_storage::StorageEngine,
+    policy_engine: &forge_query::policy::PolicyEngine,
+    principal: &str,
     parent_docs: &mut [serde_json::Value],
     joins: &std::collections::HashMap<String, forge_types::query::JoinNode>,
 ) {
     for (join_key, node) in joins {
+        let coll_ctx = forge_query::context::AuthContext::new(principal, "Read", &node.collection);
+        if policy_engine.check_permit(&coll_ctx).is_err() {
+            tracing::warn!("Join denied at collection level: {}", node.collection);
+            continue;
+        }
+
         for parent in parent_docs.iter_mut() {
             let parent_obj = if let Some(o) = parent.as_object_mut() {
                 o
@@ -393,13 +453,21 @@ fn process_joins(
                 if node.target == "id" {
                     if let Some(target_id) = on_v.as_str()
                         && let Ok(Some(bytes)) = engine.get(&node.collection, target_id)
-                            && let Ok(doc) = rmp_serde::from_slice::<serde_json::Value>(&bytes) {
-                                joined_records.push(serde_json::json!({
-                                    "id": target_id,
-                                    "doc": doc,
-                                    "_joins": serde_json::json!({})
-                                }));
-                            }
+                        && let Ok(doc) = rmp_serde::from_slice::<serde_json::Value>(&bytes)
+                    {
+                        let doc_ctx = forge_query::context::AuthContext::new(
+                            principal,
+                            "Read",
+                            format!("{}/{}", node.collection, target_id),
+                        );
+                        if policy_engine.check_permit(&doc_ctx).is_ok() {
+                            joined_records.push(serde_json::json!({
+                                "id": target_id,
+                                "doc": doc,
+                                "_joins": serde_json::json!({})
+                            }));
+                        }
+                    }
                 } else {
                     let msgpack_val =
                         forge_storage::document::serialize_doc(&on_v).unwrap_or_default();
@@ -411,7 +479,15 @@ fn process_joins(
                         100,
                     ) {
                         for (j_id, j_bytes) in matches {
-                            if let Ok(doc) = rmp_serde::from_slice::<serde_json::Value>(&j_bytes) {
+                            let doc_ctx = forge_query::context::AuthContext::new(
+                                principal,
+                                "Read",
+                                format!("{}/{}", node.collection, j_id),
+                            );
+                            if policy_engine.check_permit(&doc_ctx).is_ok()
+                                && let Ok(doc) =
+                                    rmp_serde::from_slice::<serde_json::Value>(&j_bytes)
+                            {
                                 joined_records.push(serde_json::json!({
                                     "id": j_id,
                                     "doc": doc,
@@ -424,7 +500,13 @@ fn process_joins(
             }
 
             if !node.joins.is_empty() && !joined_records.is_empty() {
-                process_joins(engine, &mut joined_records, &node.joins);
+                process_joins(
+                    engine,
+                    policy_engine,
+                    principal,
+                    &mut joined_records,
+                    &node.joins,
+                );
             }
 
             if let Some(joins_map) = parent_obj.get_mut("_joins").and_then(|j| j.as_object_mut()) {
@@ -439,6 +521,7 @@ fn process_joins(
 /// nested and securely validated Join payloads in < 1ms without explicit SQL syntax.
 async fn query_docs(
     State(state): State<AppState>,
+    axum::extract::Extension(claims): axum::extract::Extension<forge_auth::TokenClaims>,
     axum::Json(query): axum::Json<forge_types::query::JoinQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
     if let Err(e) = query.validate() {
@@ -446,27 +529,83 @@ async fn query_docs(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let principal = &claims.sub;
+    let action = "Read";
+
+    let root_ctx = forge_query::context::AuthContext::new(principal, action, &query.collection);
+    if state.policy_engine.check_permit(&root_ctx).is_err() {
+        tracing::warn!("Query denied at root collection: {}", query.collection);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
     let limit = query.resolved_limit();
-    let (docs, next_cursor) = if let Some((k, v)) = query.filter.iter().next() {
-        let msgpack_val = forge_storage::document::serialize_doc(v).unwrap_or_default();
-        state
-            .engine
-            .lookup_by_index(
-                &query.collection,
-                k,
-                &msgpack_val,
-                query.cursor.as_deref(),
-                limit,
-            )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    let mut current_cursor = query.cursor.clone();
+
+    let mut valid_docs = Vec::new();
+    let mut total_scanned = 0;
+    const MAX_SCAN_LIMIT: usize = 1000;
+    let mut last_scanned_id = None;
+
+    let msgpack_val = if let Some((_, v)) = query.filter.iter().next() {
+        Some(forge_storage::document::serialize_doc(v).unwrap_or_default())
     } else {
-        state
-            .engine
-            .list_paginated(&query.collection, query.cursor.as_deref(), limit)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        None
     };
 
-    let mut root_docs: Vec<serde_json::Value> = docs
+    while valid_docs.len() < limit && total_scanned < MAX_SCAN_LIMIT {
+        let fetch_limit = std::cmp::min(MAX_SCAN_LIMIT - total_scanned, limit);
+
+        let query_result = if let Some((k, _)) = query.filter.iter().next() {
+            state.engine.lookup_by_index(
+                &query.collection,
+                k,
+                msgpack_val.as_ref().unwrap(),
+                current_cursor.as_deref(),
+                fetch_limit,
+            )
+        } else {
+            state
+                .engine
+                .list_paginated(&query.collection, current_cursor.as_deref(), fetch_limit)
+        }
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let (docs, next_cursor) = query_result;
+        let fetched_len = docs.len();
+
+        if fetched_len == 0 {
+            break;
+        }
+
+        total_scanned += fetched_len;
+
+        for (id, bytes) in docs {
+            let resource = format!("{}/{}", query.collection, id);
+            let auth_ctx = forge_query::context::AuthContext::new(principal, action, &resource);
+
+            if state.policy_engine.check_permit(&auth_ctx).is_ok() {
+                valid_docs.push((id.clone(), bytes));
+                if valid_docs.len() == limit {
+                    last_scanned_id = Some(id);
+                    break;
+                }
+            }
+            last_scanned_id = Some(id);
+        }
+
+        current_cursor = next_cursor.clone();
+        if next_cursor.is_none() {
+            break;
+        }
+    }
+
+    let next_cursor = if valid_docs.len() == limit || current_cursor.is_some() {
+        last_scanned_id.or(current_cursor)
+    } else {
+        None
+    };
+
+    let mut root_docs: Vec<serde_json::Value> = valid_docs
         .into_iter()
         .map(|(id, bytes)| {
             let doc: serde_json::Value =
@@ -479,7 +618,13 @@ async fn query_docs(
         })
         .collect();
 
-    process_joins(&state.engine, &mut root_docs, &query.joins);
+    process_joins(
+        &state.engine,
+        &state.policy_engine,
+        principal,
+        &mut root_docs,
+        &query.joins,
+    );
 
     let has_more = next_cursor.is_some();
     let response = forge_types::pagination::PaginatedResponse {

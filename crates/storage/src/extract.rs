@@ -26,7 +26,7 @@ pub fn extract_field_raw<'a>(doc: &'a [u8], field: &str) -> Result<Option<&'a [u
     for _ in 0..len {
         // Read key
         let key_start = cursor.position() as usize;
-        skip_value(&mut cursor)?;
+        skip_value(&mut cursor, 0)?;
         let key_end = cursor.position() as usize;
 
         let key_slice = &doc[key_start..key_end];
@@ -43,7 +43,7 @@ pub fn extract_field_raw<'a>(doc: &'a [u8], field: &str) -> Result<Option<&'a [u
 
         // Read value bounds
         let val_start = cursor.position() as usize;
-        skip_value(&mut cursor)?;
+        skip_value(&mut cursor, 0)?;
         let val_end = cursor.position() as usize;
 
         if is_match {
@@ -73,7 +73,11 @@ fn read_data_u32(cursor: &mut Cursor<&[u8]>) -> std::result::Result<u32, std::io
 }
 
 /// Recursively skips a single MessagePack value in the cursor.
-fn skip_value(cursor: &mut Cursor<&[u8]>) -> Result<()> {
+fn skip_value(cursor: &mut Cursor<&[u8]>, depth: u32) -> Result<()> {
+    if depth > 64 {
+        return Err(ForgeError::Serialization("depth limit exceeded".into()));
+    }
+
     let marker = rmp::decode::read_marker(cursor)
         .map_err(|_| ForgeError::Serialization("EOF during skip".into()))?;
 
@@ -118,41 +122,41 @@ fn skip_value(cursor: &mut Cursor<&[u8]>) -> Result<()> {
         }
         Marker::FixArray(len) => {
             for _ in 0..len {
-                skip_value(cursor)?;
+                skip_value(cursor, depth + 1)?;
             }
             Ok(())
         }
         Marker::Array16 => {
             let len = read_data_u16(cursor).map_err(|_| ForgeError::Serialization("EOF".into()))?;
             for _ in 0..len {
-                skip_value(cursor)?;
+                skip_value(cursor, depth + 1)?;
             }
             Ok(())
         }
         Marker::Array32 => {
             let len = read_data_u32(cursor).map_err(|_| ForgeError::Serialization("EOF".into()))?;
             for _ in 0..len {
-                skip_value(cursor)?;
+                skip_value(cursor, depth + 1)?;
             }
             Ok(())
         }
         Marker::FixMap(len) => {
             for _ in 0..len * 2 {
-                skip_value(cursor)?;
+                skip_value(cursor, depth + 1)?;
             }
             Ok(())
         }
         Marker::Map16 => {
             let len = read_data_u16(cursor).map_err(|_| ForgeError::Serialization("EOF".into()))?;
             for _ in 0..len * 2 {
-                skip_value(cursor)?;
+                skip_value(cursor, depth + 1)?;
             }
             Ok(())
         }
         Marker::Map32 => {
             let len = read_data_u32(cursor).map_err(|_| ForgeError::Serialization("EOF".into()))?;
             for _ in 0..len * 2 {
-                skip_value(cursor)?;
+                skip_value(cursor, depth + 1)?;
             }
             Ok(())
         }
@@ -250,5 +254,26 @@ mod tests {
         let decoded: String = rmp_serde::from_slice(extracted).unwrap();
 
         assert_eq!(decoded, "right"); // Top level only
+    }
+
+    #[test]
+    fn limits_recursion_depth_to_prevent_stack_overflow() {
+        // Create 100 nested arrays: [[[[...]]]]
+        let mut bytes = Vec::new();
+        for _ in 0..100 {
+            rmp::encode::write_array_len(&mut bytes, 1).unwrap();
+        }
+        rmp::encode::write_str(&mut bytes, "deep_value").unwrap();
+
+        // The document must be a map at the root for extract_field_raw
+        let mut doc = Vec::new();
+        rmp::encode::write_map_len(&mut doc, 1).unwrap();
+        rmp::encode::write_str(&mut doc, "nested_array").unwrap();
+        doc.extend(bytes);
+
+        let res = extract_field_raw(&doc, "missing");
+        assert!(
+            matches!(res, Err(ForgeError::Serialization(msg)) if msg.contains("depth limit exceeded"))
+        );
     }
 }
