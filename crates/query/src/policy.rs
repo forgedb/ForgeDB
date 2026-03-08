@@ -32,6 +32,14 @@ pub struct PolicyEngine {
     schema: Schema,
 }
 
+impl std::fmt::Debug for PolicyEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicyEngine")
+            .field("policies", &self.policies)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PolicyEngine {
     /// Builds a new, validated engine from raw Cedar source code.
     ///
@@ -49,10 +57,16 @@ impl PolicyEngine {
 
         let schema = forge_schema()?;
 
-        // Normally in a larger production system we'd use the Validator to heavily enforce
-        // `policies` against `schema` right here. But for v0.2.0? Cedar's standard
-        // flow actually evaluates them together safely enough. The parser above catches the
-        // syntax bugs, and the schema dictates shape at runtime.
+        // Mandatory Validation: catch bugs like typos and type mismatches early.
+        let validator = cedar_policy::Validator::new(schema.clone());
+        let output = validator.validate(&policies, cedar_policy::ValidationMode::Strict);
+        if !output.validation_passed() {
+            let errors: Vec<String> = output.validation_errors().map(|e| e.to_string()).collect();
+            return Err(ForgeError::Policy(format!(
+                "policy validation failed: {}",
+                errors.join("; ")
+            )));
+        }
 
         Ok(Self {
             authorizer: Authorizer::new(),
@@ -168,5 +182,17 @@ mod tests {
     fn invalid_syntax_caught_at_construction() {
         let src = r#"permit( principal = "whoops" )"#; // = instead of ==
         assert!(PolicyEngine::new(src).is_err());
+    }
+
+    #[test]
+    fn schema_validation_catches_typos() {
+        // "owner" is valid, "ownerrr" is not in our schema
+        let src = r#"
+            permit(principal, action, resource)
+            when { resource.ownerrr == "alice" };
+        "#;
+        let err = PolicyEngine::new(src).unwrap_err();
+        assert!(err.to_string().contains("validation failed"));
+        assert!(err.to_string().contains("ownerrr"));
     }
 }

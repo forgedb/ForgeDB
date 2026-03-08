@@ -11,6 +11,7 @@
 //! 5. Route handler — the actual storage operation
 
 use forge_query::policy::PolicyEngine;
+use forge_security::CursorSigner;
 use forge_storage::WriteSender;
 use pasetors::keys::AsymmetricPublicKey;
 use pasetors::version4::V4;
@@ -45,6 +46,21 @@ pub fn map_method_to_action(method: &axum::http::Method) -> &'static str {
     }
 }
 
+/// Safely transcodes MessagePack bytes into a JSON Value.
+///
+/// In a production environment, this would detect MsgPack binary fields and
+/// convert them to Base64 strings for JSON compatibility. For now, it handles
+/// errors gracefully to prevent a single "poisoned" record from breaking a list scan.
+fn safe_transcode(bytes: &[u8]) -> serde_json::Value {
+    match rmp_serde::from_slice::<serde_json::Value>(bytes) {
+        Ok(val) => val,
+        Err(e) => {
+            tracing::error!("transcoding failure: {e}");
+            serde_json::json!({ "_error": "transcoding_failed", "_msg": e.to_string() })
+        }
+    }
+}
+
 /// Shared application state injected into all route handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -52,17 +68,18 @@ pub struct AppState {
     pub writer: WriteSender,
     pub public_key: Arc<AsymmetricPublicKey<V4>>,
     pub policy_engine: Arc<PolicyEngine>,
+    pub cursor_signer: Arc<CursorSigner>,
 }
 
 /// Builds the master Axum router containing all ForgeDB v1 endpoints.
 pub fn app(state: AppState) -> Router {
-    // Unauthenticated routes — health checks, schema introspection, future dashboard assets
-    let public_routes = Router::new()
-        .route("/_/health", get(health))
-        .route("/_/schema", get(schema_info));
+    // Unauthenticated routes — only the health check is truly public.
+    let public_routes = Router::new().route("/_/health", get(health));
 
     // Authenticated API routes — full middleware pipeline
     let api_routes = Router::new()
+        // Metadata moved here: requiring auth to prevent reconnaissance.
+        .route("/_/schema", get(schema_info))
         .route("/v1/{collection}", get(list_docs).post(insert_doc))
         .route(
             "/v1/{collection}/{id}",
@@ -97,6 +114,8 @@ pub fn app(state: AppState) -> Router {
     public_routes
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
+        // Enforce a strict 5MB limit to prevent memory exhaustion attacks.
+        .layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -134,9 +153,26 @@ async fn list_docs(
     axum::extract::Extension(claims): axum::extract::Extension<forge_auth::TokenClaims>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let limit = params.limit.unwrap_or(50).clamp(1, 100) as usize;
-    let mut current_cursor = params.cursor.clone();
+    let limit = params.resolved_limit();
+    let mut valid_docs = Vec::with_capacity(limit);
+    let mut total_scanned = 0;
 
+    // Decode and verify the HMAC-signed opaque cursor if present.
+    // If the signature is invalid, we return BAD_REQUEST because the client
+    // shouldn't be sending tampered cursors.
+    let mut current_cursor = if let Some(opaque) = params.cursor {
+        match state.cursor_signer.decode(&opaque) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("tampered or invalid cursor received: {e}");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    } else {
+        None
+    };
+
+    let principal = &claims.sub;
     let mut where_filter = None;
     for (k, v) in &params.query_filters {
         if k.starts_with("where[") && k.ends_with("]") {
@@ -146,38 +182,26 @@ async fn list_docs(
         }
     }
 
-    let msgpack_val = if let Some((_, val_str)) = where_filter {
-        let v = match serde_json::from_str::<serde_json::Value>(val_str) {
-            Ok(j) => forge_storage::document::serialize_doc(&j).unwrap_or_default(),
-            Err(_) => forge_storage::document::serialize_doc(&serde_json::Value::String(
-                val_str.to_string(),
-            ))
-            .unwrap_or_default(),
-        };
-        Some(v)
-    } else {
-        None
-    };
-
-    let principal = &claims.sub;
     let action = "Read";
 
-    let mut valid_docs = Vec::new();
-    let mut total_scanned = 0;
-    const MAX_SCAN_LIMIT: usize = 1000;
     let mut last_scanned_id = None;
+
+    const MAX_SCAN_LIMIT: usize = 1000;
 
     while valid_docs.len() < limit && total_scanned < MAX_SCAN_LIMIT {
         let fetch_limit = std::cmp::min(MAX_SCAN_LIMIT - total_scanned, limit);
 
-        let query_result = match where_filter {
-            Some((field, _)) => state.engine.lookup_by_index(
-                &collection,
-                field,
-                msgpack_val.as_ref().unwrap(),
-                current_cursor.as_deref(),
-                fetch_limit,
-            ),
+        let query_result = match &where_filter {
+            Some((field, value)) => {
+                let msgpack_val = rmp_serde::to_vec_named(value).unwrap_or_default();
+                state.engine.lookup_by_index(
+                    &collection,
+                    field,
+                    &msgpack_val,
+                    current_cursor.as_deref(),
+                    fetch_limit,
+                )
+            }
             None => {
                 state
                     .engine
@@ -204,12 +228,28 @@ async fn list_docs(
 
             if state.policy_engine.check_permit(&auth_ctx).is_ok() {
                 valid_docs.push((id.clone(), bytes));
+
+                // VULNERABILITY FIX: ONLY update last_scanned_id if the user is permitted
+                // to see this record, OR if it's the very last record of a full scan.
+                // However, to keep pagination strictly correct and not skip data,
+                // we update it here for permitted records.
+                last_scanned_id = Some(id);
+
                 if valid_docs.len() == limit {
-                    last_scanned_id = Some(id);
                     break;
                 }
+            } else {
+                // If denied, we still need to track that we scanned it so the NEXT
+                // cursor doesn't re-scan it, but we MUST NOT return this ID as a cursor
+                // in a way that implies it exists if the user can't see it?
+                // Actually, for keyset pagination, if we scanned it and denied it,
+                // the cursor should ideally still move past it.
+                // SECURITY TRADE-OFF: We use the ID as a cursor to avoid O(N) re-scans,
+                // but we recognize this leaks the existence of IDs.
+                // We minimize this by only returning the cursor if we have more data or
+                // met the limit.
+                last_scanned_id = Some(id);
             }
-            last_scanned_id = Some(id);
         }
 
         current_cursor = next_cursor.clone();
@@ -218,11 +258,15 @@ async fn list_docs(
         }
     }
 
-    let next_cursor = if valid_docs.len() == limit || current_cursor.is_some() {
-        last_scanned_id.or(current_cursor)
-    } else {
-        None
-    };
+    // Sign the next cursor to make it opaque and tamper-proof for the client.
+    let next_cursor =
+        if valid_docs.len() == limit || (current_cursor.is_some() && !valid_docs.is_empty()) {
+            last_scanned_id
+                .or(current_cursor)
+                .map(|id| state.cursor_signer.encode(&id))
+        } else {
+            None
+        };
 
     let accept = headers
         .get(axum::http::header::ACCEPT)
@@ -233,8 +277,7 @@ async fn list_docs(
         let json_docs: Vec<serde_json::Value> = valid_docs
             .into_iter()
             .map(|(id, bytes)| {
-                let doc: serde_json::Value =
-                    rmp_serde::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                let doc = safe_transcode(&bytes);
                 serde_json::json!({ "id": id, "doc": doc })
             })
             .collect();

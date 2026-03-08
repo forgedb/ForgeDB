@@ -42,6 +42,7 @@ fn test_harness() -> (axum::Router, String, TempDir) {
         writer,
         public_key,
         policy_engine,
+        cursor_signer: std::sync::Arc::new(forge_security::CursorSigner::new(&[0u8; 32])),
     };
 
     // Issue a valid token for our test user
@@ -72,6 +73,7 @@ fn deny_harness() -> (axum::Router, String, TempDir) {
         writer,
         public_key,
         policy_engine,
+        cursor_signer: std::sync::Arc::new(forge_security::CursorSigner::new(&[0u8; 32])),
     };
 
     let claims = TokenClaims::new("denied-user", 3600, None);

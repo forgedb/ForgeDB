@@ -63,6 +63,10 @@ pub enum ForgeError {
     /// Audit log violations — immutability guarantees or disk failure.
     #[error("audit error: {0}")]
     Audit(String),
+
+    /// General security-related failures (e.g. cursor tampering, invalid signatures).
+    #[error("security error: {0}")]
+    Security(String),
 }
 
 #[cfg(test)]
