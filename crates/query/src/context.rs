@@ -1,12 +1,17 @@
 //! Request context for Cedar policy evaluation.
 //!
-//! Every single time a user hits the database to touch a document, we have to build a Cedar
-//! `Request` and pass it to the engine. The `AuthContext` struct holds the raw strings —
-//! usually yanked straight from PASETO tokens or the route itself — and handles the slightly
-//! tedious, but necessary, conversion into typed Cedar `EntityUid` objects.
+//! Every database hit builds a Cedar `Request` from this struct — principal comes
+//! from the PASETO sub claim, action from the HTTP verb, resource from the route.
 //!
-//! We pass this thing by reference (`&AuthContext`) on the hot path. Why? To keep allocations
-//! as low as Cedar's API physically allows. Allocating in the query path is just asking for a bad time.
+//! One design choice worth flagging: all resources are always typed `ForgeDB::Document`.
+//! The entity ID carries the full `"collection"` or `"collection/id"` string for
+//! fine-grained policy discrimination. We could map each collection to its own entity
+//! type (which the dynamic schema hot-reload work sets up), but that's a v0.3 feature;
+//! doing it at the context level caused a nasty class of bugs where `collection == "user"`
+//! produced `ForgeDB::User::\"user\"` — a *principal* type, not a resource type — and
+//! Cedar's strict request validation blew up before any policy ever ran.
+//!
+//! Kept by reference on the hot path to avoid gratuitous clones.
 
 use cedar_policy::{Context, EntityUid, Request};
 
@@ -52,39 +57,30 @@ impl AuthContext {
 
     /// Converts this context into a strictly typed Cedar `Request`.
     ///
+    /// Resources are always typed `ForgeDB::Document` regardless of the collection name.
+    /// The full `"collection"` or `"collection/id"` string lives in the entity ID so Cedar
+    /// policies can still discriminate at whatever granularity they want:
+    ///
+    /// ```cedar
+    /// // Permit reads on the whole "posts" collection
+    /// permit(principal, action == ForgeDB::Action::"Read",
+    ///        resource == ForgeDB::Document::"posts");
+    ///
+    /// // Or a single document
+    /// permit(principal, action == ForgeDB::Action::"Read",
+    ///        resource == ForgeDB::Document::"posts/abc-123");
+    /// ```
+    ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Policy`] if the principal, action, or resource
-    /// strings can't be wrangled into valid Cedar `EntityUid`s. For instance,
-    /// if some client sends over malicious characters that Cedar outright rejects in entity IDs.
+    /// Returns [`ForgeError::Policy`] if the action string is unrecognized or if Cedar
+    /// rejects malformed characters in the principal/resource IDs after escaping.
     pub fn to_cedar_request(&self, schema: Option<&cedar_policy::Schema>) -> Result<Request> {
-        let parts: Vec<&str> = self.resource.splitn(2, '/').collect();
-        let entity_type = if parts.len() == 2 {
-            // "users/123" -> entity_type = "users", entity_id = "123"
-            parts[0]
-        } else {
-            // "users" -> entity_type = "users", entity_id = "*"
-            parts[0]
-        };
-        let entity_type_cap = match entity_type {
-            "_" => "Document".to_string(), // fallback
-            other => {
-                // Capitalize first letter to match Cedar conventions usually
-                let mut c = other.chars();
-                match c.next() {
-                    None => String::new(),
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                }
-            }
-        };
-
         let principal_eid = format!(r#"ForgeDB::User::"{}""#, cedar_escape(&self.principal));
         let action_eid = format!(r#"ForgeDB::Action::"{}""#, cedar_escape(&self.action));
-        let resource_eid = format!(
-            r#"ForgeDB::{}::"{}""#,
-            entity_type_cap,
-            cedar_escape(&self.resource)
-        );
+
+        // Always Document — see module doc for why we stopped deriving from the collection name.
+        let resource_eid = format!(r#"ForgeDB::Document::"{}""#, cedar_escape(&self.resource));
 
         let p_uid: EntityUid = principal_eid
             .parse()
@@ -122,9 +118,24 @@ mod tests {
             req.action().unwrap().to_string(),
             r#"ForgeDB::Action::"Read""#
         );
+        // Resource is always ForgeDB::Document regardless of what the collection name is.
         assert_eq!(
             req.resource().unwrap().to_string(),
             r#"ForgeDB::Document::"document/123""#
+        );
+    }
+
+    #[test]
+    fn collection_named_user_resolves_as_document_not_principal_type() {
+        let ctx = AuthContext::new("admin", "Read", "user");
+        let req = ctx
+            .to_cedar_request(None)
+            .expect("collection named 'user' must not blow up Cedar request construction");
+
+        assert_eq!(
+            req.resource().unwrap().to_string(),
+            r#"ForgeDB::Document::"user""#,
+            "resource must always be Document, never a principal type"
         );
     }
 
