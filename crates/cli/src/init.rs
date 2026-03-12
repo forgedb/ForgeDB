@@ -67,8 +67,9 @@ pub fn run_init(opts: InitOptions) -> Result<()> {
     let _engine = StorageEngine::create(&db_path, &opts.password)?;
     tracing::info!("initialized encrypted database");
 
-    // 5. Write a strictly default Cedar policy file so we have a secure baseline
+    // 5. Write a strictly default Cedar policy file and schema so we have a secure baseline
     let policy_path = opts.data_dir.join("policy.cedar");
+    let schema_path = opts.data_dir.join("schema.json");
     if !policy_path.exists() {
         let default_policy = r#"// ForgeDB root access policy
 // This serves as the default blanket administrator policy.
@@ -81,6 +82,14 @@ permit(
 "#;
         std::fs::write(&policy_path, default_policy)?;
         tracing::info!("wrote default policy.cedar");
+    }
+
+    if !schema_path.exists() {
+        let default_schema = forge_query::schema::forge_schema_json();
+        let schema_str = serde_json::to_string_pretty(&default_schema)
+            .map_err(|e| ForgeError::Config(format!("failed to serialize default schema: {e}")))?;
+        std::fs::write(&schema_path, schema_str)?;
+        tracing::info!("wrote default schema.json");
     }
 
     // 6. Write config file

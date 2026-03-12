@@ -98,12 +98,11 @@ impl App {
     fn new(url: String, token: Option<String>, cert_path: Option<PathBuf>) -> App {
         let mut builder = Client::builder();
 
-        if let Some(path) = cert_path {
-            if let Ok(cert_bytes) = std::fs::read(&path) {
-                if let Ok(cert) = reqwest::Certificate::from_pem(&cert_bytes) {
-                    builder = builder.add_root_certificate(cert);
-                }
-            }
+        if let Some(path) = cert_path
+            && let Ok(cert_bytes) = std::fs::read(&path)
+            && let Ok(cert) = reqwest::Certificate::from_pem(&cert_bytes)
+        {
+            builder = builder.add_root_certificate(cert);
         }
 
         let client = builder.build().unwrap_or_else(|_| Client::new());
@@ -267,7 +266,7 @@ impl App {
                 if resp.status().is_success() {
                     let json: Value = resp.json().await.unwrap_or_default();
                     self.collections.clear();
-                    if let Some(colls) = json.get("collections").and_then(|c| c.as_array()) {
+                    if let Some(colls) = json.get("entity_types").and_then(|c| c.as_array()) {
                         for c in colls {
                             if let Some(name) = c.get("name").and_then(|n| n.as_str()) {
                                 self.collections.push(name.to_string());
@@ -296,7 +295,11 @@ impl App {
     async fn fetch_collection(&mut self) {
         if let Some(i) = self.collections_state.selected() {
             let col = &self.collections[i];
-            let req = self.client.get(format!("{}/v1/{}?limit=50", self.url, col));
+            // Explicitly ask for JSON — without this header, the server defaults
+            // to application/msgpack, which reqwest's .json() can't decode.
+            let req = self.client
+                .get(format!("{}/v1/{}?limit=50", self.url, col))
+                .header(reqwest::header::ACCEPT, "application/json");
             let req = if let Some(t) = &self.bearer_token {
                 req.bearer_auth(t)
             } else {
@@ -307,10 +310,8 @@ impl App {
                     let json: Value = resp.json().await.unwrap_or_default();
                     if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
                         self.docs = data.clone();
-                        // Reset doc selection if we switched collections
-                        if self.docs_state.selected().is_none()
-                            || self.docs_state.selected().unwrap() >= self.docs.len()
-                        {
+                        // Reset doc selection if we switched collections or the index is now out of range.
+                        if self.docs_state.selected().is_none_or(|s| s >= self.docs.len()) {
                             self.docs_state.select(if !self.docs.is_empty() {
                                 Some(0)
                             } else {
@@ -366,6 +367,74 @@ impl App {
                     return;
                 }
             };
+
+            if !self.collections.contains(&editor.collection) {
+                // New collection — patch the Cedar schema dynamically so the server
+                // accepts documents for it. We fetch the raw schema, inject the new
+                // entity type + resource type entries, then PUT it back.
+                let schema_req = self.client.get(format!("{}/_/schema?raw=true", self.url));
+                let schema_req = if let Some(t) = &self.bearer_token {
+                    schema_req.bearer_auth(t)
+                } else {
+                    schema_req
+                };
+
+                if let Ok(resp) = schema_req.send().await
+                    && resp.status().is_success()
+                    && let Ok(mut schema) = resp.json::<Value>().await
+                {
+                    let coll_name_cap = {
+                        let mut c = editor.collection.chars();
+                        match c.next() {
+                            None => String::new(),
+                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        }
+                    };
+
+                    let mut modified = false;
+
+                    if let Some(ns) = schema.get_mut("ForgeDB").and_then(|n| n.as_object_mut()) {
+                        if let Some(et) = ns.get_mut("entityTypes").and_then(|e| e.as_object_mut())
+                            && !et.contains_key(&coll_name_cap)
+                        {
+                            et.insert(
+                                coll_name_cap.clone(),
+                                serde_json::json!({
+                                    "shape": { "type": "Record", "attributes": {} }
+                                }),
+                            );
+                            modified = true;
+                        }
+
+                        if let Some(actions) =
+                            ns.get_mut("actions").and_then(|a| a.as_object_mut())
+                        {
+                            for action in ["Read", "Write", "Delete"] {
+                                if let Some(act) = actions.get_mut(action).and_then(|a| a.as_object_mut())
+                                    && let Some(applies) = act.get_mut("appliesTo").and_then(|ap| ap.as_object_mut())
+                                    && let Some(rt) = applies.get_mut("resourceTypes").and_then(|r| r.as_array_mut())
+                                {
+                                    let val = serde_json::Value::String(coll_name_cap.clone());
+                                    if !rt.contains(&val) {
+                                        rt.push(val);
+                                        modified = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if modified {
+                        let put_req = self.client.put(format!("{}/_/schema", self.url));
+                        let put_req = if let Some(t) = &self.bearer_token {
+                            put_req.bearer_auth(t)
+                        } else {
+                            put_req
+                        };
+                        let _ = put_req.json(&schema).send().await;
+                    }
+                }
+            }
 
             let res = if let Some(id) = &editor.doc_id {
                 // PATCH
@@ -545,10 +614,8 @@ impl App {
 ///
 /// ```no_run
 /// use forge_cli::tui;
-///
-/// // Assuming the server is up at localhost:5826
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// tui::run("https://localhost:5826".to_string(), None)?;
+/// tui::run("https://localhost:5826".to_string(), None, None)?;
 /// # Ok(())
 /// # }
 /// ```
@@ -630,21 +697,33 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                 }
                 AppScreen::Setup => {
                     if key.code == KeyCode::Enter {
-                        app.submit_setup().await;
+                        if app.auth_form.focused < 2 {
+                            app.auth_form.focused += 1;
+                        } else {
+                            app.submit_setup().await;
+                        }
                     } else {
                         app.handle_input(key.code);
                     }
                 }
                 AppScreen::Login => {
                     if key.code == KeyCode::Enter {
-                        app.submit_login().await;
+                        if app.auth_form.focused < 1 {
+                            app.auth_form.focused += 1;
+                        } else {
+                            app.submit_login().await;
+                        }
                     } else {
                         app.handle_input(key.code);
                     }
                 }
                 AppScreen::NewUser => {
                     if key.code == KeyCode::Enter {
-                        app.submit_new_user().await;
+                        if app.auth_form.focused < 2 {
+                            app.auth_form.focused += 1;
+                        } else {
+                            app.submit_new_user().await;
+                        }
                     } else {
                         app.handle_input(key.code);
                     }
@@ -910,10 +989,8 @@ fn draw_initializing(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_auth_form(f: &mut Frame, app: &mut App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(0)])
-        .split(center_rect(60, 40, area));
+    // Just use the center rect directly. Nested splits can collapse the height entirely on smaller terminals.
+    let form_area = center_rect(60, 80, area);
 
     let title = match app.screen {
         AppScreen::Setup => " SETUP ",
@@ -926,121 +1003,86 @@ fn draw_auth_form(f: &mut Frame, app: &mut App, area: Rect) {
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(56, 189, 248)))
-        .style(Style::default()); // No background, as requested
+        .style(Style::default());
 
-    f.render_widget(Clear, chunks[0]);
-    f.render_widget(block.clone(), chunks[0]);
+    f.render_widget(block.clone(), form_area);
 
     let inputs = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
+        .spacing(2)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Length(2),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
-        .split(block.inner(chunks[0]));
+        .split(block.inner(form_area));
 
-    let active = Style::default()
-        .fg(Color::Rgb(2, 132, 199))
-        .add_modifier(Modifier::BOLD);
-    let inactive = Style::default().fg(Color::Rgb(148, 163, 184));
+    let render_input = |f: &mut Frame, text: String, is_active: bool, area: Rect| {
+        let active = Style::default()
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let inactive = Style::default().fg(Color::DarkGray);
+
+        f.render_widget(
+            Paragraph::new(text).style(if is_active { active } else { inactive }),
+            area,
+        );
+    };
 
     match app.screen {
         AppScreen::Setup => {
-            f.render_widget(
-                Paragraph::new(format!("PASETO: {}", app.auth_form.token)).style(
-                    if app.auth_form.focused == 0 {
-                        active
-                    } else {
-                        inactive
-                    },
-                ),
+            render_input(
+                f,
+                format!("PASETO: {}", app.auth_form.token),
+                app.auth_form.focused == 0,
                 inputs[0],
             );
-            f.render_widget(
-                Paragraph::new(format!(
-                    "Password: {}",
-                    "*".repeat(app.auth_form.password.len())
-                ))
-                .style(if app.auth_form.focused == 1 {
-                    active
-                } else {
-                    inactive
-                }),
+            render_input(
+                f,
+                format!("Password: {}", "*".repeat(app.auth_form.password.len())),
+                app.auth_form.focused == 1,
                 inputs[1],
             );
-            f.render_widget(
-                Paragraph::new(format!(
-                    "Confirm:  {}",
-                    "*".repeat(app.auth_form.confirm.len())
-                ))
-                .style(if app.auth_form.focused == 2 {
-                    active
-                } else {
-                    inactive
-                }),
+            render_input(
+                f,
+                format!("Confirm:  {}", "*".repeat(app.auth_form.confirm.len())),
+                app.auth_form.focused == 2,
                 inputs[2],
             );
         }
         AppScreen::Login => {
-            f.render_widget(
-                Paragraph::new(format!("Username: {}", app.auth_form.username)).style(
-                    if app.auth_form.focused == 0 {
-                        active
-                    } else {
-                        inactive
-                    },
-                ),
+            render_input(
+                f,
+                format!("Username: {}", app.auth_form.username),
+                app.auth_form.focused == 0,
                 inputs[0],
             );
-            f.render_widget(
-                Paragraph::new(format!(
-                    "Password: {}",
-                    "*".repeat(app.auth_form.password.len())
-                ))
-                .style(if app.auth_form.focused == 1 {
-                    active
-                } else {
-                    inactive
-                }),
+            render_input(
+                f,
+                format!("Password: {}", "*".repeat(app.auth_form.password.len())),
+                app.auth_form.focused == 1,
                 inputs[1],
             );
         }
         AppScreen::NewUser => {
-            f.render_widget(
-                Paragraph::new(format!("Username: {}", app.auth_form.username)).style(
-                    if app.auth_form.focused == 0 {
-                        active
-                    } else {
-                        inactive
-                    },
-                ),
+            render_input(
+                f,
+                format!("Username: {}", app.auth_form.username),
+                app.auth_form.focused == 0,
                 inputs[0],
             );
-            f.render_widget(
-                Paragraph::new(format!(
-                    "Password: {}",
-                    "*".repeat(app.auth_form.password.len())
-                ))
-                .style(if app.auth_form.focused == 1 {
-                    active
-                } else {
-                    inactive
-                }),
+            render_input(
+                f,
+                format!("Password: {}", "*".repeat(app.auth_form.password.len())),
+                app.auth_form.focused == 1,
                 inputs[1],
             );
-            f.render_widget(
-                Paragraph::new(format!(
-                    "Confirm:  {}",
-                    "*".repeat(app.auth_form.confirm.len())
-                ))
-                .style(if app.auth_form.focused == 2 {
-                    active
-                } else {
-                    inactive
-                }),
+            render_input(
+                f,
+                format!("Confirm:  {}", "*".repeat(app.auth_form.confirm.len())),
+                app.auth_form.focused == 2,
                 inputs[2],
             );
         }

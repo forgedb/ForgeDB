@@ -29,7 +29,7 @@ use axum::{
     routing::get,
 };
 use forge_storage::StorageEngine;
-use tower_http::trace::TraceLayer;
+use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
 /// Maps HTTP verbs to ForgeDB action names for Cedar and audit logging.
 ///
@@ -69,8 +69,10 @@ pub struct AppState {
     pub writer: WriteSender,
     pub public_key: Arc<AsymmetricPublicKey<V4>>,
     pub secret_key: Arc<AsymmetricSecretKey<V4>>,
-    pub policy_engine: Arc<PolicyEngine>,
+    pub policy_engine: Arc<tokio::sync::RwLock<PolicyEngine>>,
     pub cursor_signer: Arc<CursorSigner>,
+    pub schema_path: std::path::PathBuf,
+    pub policy_path: std::path::PathBuf,
 }
 
 /// Builds the master Axum router containing all ForgeDB v1 endpoints.
@@ -84,7 +86,7 @@ pub fn app(state: AppState) -> Router {
 
     // Authenticated API routes
     let api = Router::new()
-        .route("/_/schema", get(schema_info))
+        .route("/_/schema", get(schema_info).put(update_schema))
         .route("/_/auth/users", axum::routing::post(auth_api::create_user))
         .route("/v1/{collection}", get(list_docs).post(insert_doc))
         .route(
@@ -117,6 +119,9 @@ pub fn app(state: AppState) -> Router {
         .merge(public)
         .merge(api)
         .layer(TraceLayer::new_for_http())
+        // Gzip compress responses for clients that advertise Accept-Encoding: gzip.
+        // Especially helps paginated list responses at 50+ docs — can cut wire bytes by 60-70%.
+        .layer(CompressionLayer::new())
         .layer(axum::extract::DefaultBodyLimit::max(5 * 1024 * 1024))
         .with_state(state)
 }
@@ -129,18 +134,82 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+#[derive(serde::Deserialize)]
+pub struct SchemaQuery {
+    pub raw: Option<bool>,
+}
+
 /// `GET /_/schema` — Cedar namespace introspection.
 ///
 /// Unauthenticated endpoint that returns the structured `SchemaInfo` so the
 /// Leptos dashboard can provide auto-completion for policies.
-async fn schema_info() -> Result<impl IntoResponse, StatusCode> {
-    match forge_query::introspect_schema() {
-        Ok(info) => Ok(Json(info)),
+async fn schema_info(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<SchemaQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let schema_json = {
+        let pe_guard = state.policy_engine.read().await;
+        pe_guard.raw_schema.clone()
+    };
+
+    if query.raw.unwrap_or(false) {
+        return Ok(Json(schema_json).into_response());
+    }
+
+    match forge_query::introspect_schema(&schema_json) {
+        Ok(info) => Ok(Json(info).into_response()),
         Err(e) => {
             tracing::error!("schema introspection failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// `PUT /_/schema` — Hot-reload dynamic Cedar schema.
+///
+/// Updates the schema JSON, validates it against the active Cedar policy,
+/// saves it to disk, and hot-swaps the PolicyEngine.
+async fn update_schema(
+    State(state): State<AppState>,
+    axum::extract::Extension(claims): axum::extract::Extension<forge_auth::TokenClaims>,
+    axum::Json(new_schema): axum::Json<serde_json::Value>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let principal = &claims.sub;
+
+    let pe_guard = state.policy_engine.read().await;
+    let auth_ctx = forge_query::context::AuthContext::new(principal, "Write", "_schema");
+    if pe_guard.check_permit(&auth_ctx).is_err() {
+        tracing::warn!("Schema update denied for {}", principal);
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let cedar_src = pe_guard.cedar_src.clone();
+    drop(pe_guard);
+
+    let new_engine = match PolicyEngine::new(&cedar_src, new_schema.clone()) {
+        Ok(engine) => engine,
+        Err(e) => {
+            tracing::warn!("Invalid schema update attempted: {e}");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    let schema_str = serde_json::to_string_pretty(&new_schema).map_err(|e| {
+        tracing::error!("Failed to serialize new schema: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Err(e) = std::fs::write(&state.schema_path, schema_str) {
+        tracing::error!("Failed to write schema.json to disk: {e}");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let mut write_guard = state.policy_engine.write().await;
+    *write_guard = new_engine;
+
+    tracing::info!("Schema successfully hot-reloaded");
+
+    Ok(StatusCode::OK)
 }
 
 /// GET /v1/:collection
@@ -187,6 +256,7 @@ async fn list_docs(
     let action = "Read";
 
     let mut last_scanned_id = None;
+    let pe_guard = state.policy_engine.read().await;
 
     const MAX_SCAN_LIMIT: usize = 1000;
 
@@ -228,7 +298,7 @@ async fn list_docs(
             let resource = format!("{}/{}", collection, id);
             let auth_ctx = forge_query::context::AuthContext::new(principal, action, &resource);
 
-            if state.policy_engine.check_permit(&auth_ctx).is_ok() {
+            if pe_guard.check_permit(&auth_ctx).is_ok() {
                 valid_docs.push((id.clone(), bytes));
 
                 last_scanned_id = Some(id);
@@ -564,8 +634,10 @@ async fn query_docs(
     let principal = &claims.sub;
     let action = "Read";
 
+    let pe_guard = state.policy_engine.read().await;
+
     let root_ctx = forge_query::context::AuthContext::new(principal, action, &query.collection);
-    if state.policy_engine.check_permit(&root_ctx).is_err() {
+    if pe_guard.check_permit(&root_ctx).is_err() {
         tracing::warn!("Query denied at root collection: {}", query.collection);
         return Err(StatusCode::FORBIDDEN);
     }
@@ -615,7 +687,7 @@ async fn query_docs(
             let resource = format!("{}/{}", query.collection, id);
             let auth_ctx = forge_query::context::AuthContext::new(principal, action, &resource);
 
-            if state.policy_engine.check_permit(&auth_ctx).is_ok() {
+            if pe_guard.check_permit(&auth_ctx).is_ok() {
                 valid_docs.push((id.clone(), bytes));
                 if valid_docs.len() == limit {
                     last_scanned_id = Some(id);
@@ -652,7 +724,7 @@ async fn query_docs(
 
     process_joins(
         &state.engine,
-        &state.policy_engine,
+        &pe_guard,
         principal,
         &mut root_docs,
         &query.joins,

@@ -10,8 +10,6 @@ use serde_json::Value;
 
 use forge_types::Result;
 
-use crate::schema::forge_schema_json;
-
 /// The overall shape of the ForgeDB Cedar namespace.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct SchemaInfo {
@@ -60,9 +58,7 @@ pub struct ActionInfo {
 ///
 /// # Errors
 /// Returns [`ForgeError::Policy`] if the schema introspection fails.
-pub fn introspect_schema() -> Result<SchemaInfo> {
-    let schema_json = forge_schema_json();
-
+pub fn introspect_schema(schema_json: &serde_json::Value) -> Result<SchemaInfo> {
     let ns = schema_json.get("ForgeDB").ok_or_else(|| {
         forge_types::ForgeError::Policy("ForgeDB namespace missing from schema".into())
     })?;
@@ -152,7 +148,8 @@ mod tests {
 
     #[test]
     fn introspection_yields_expected_shape() {
-        let info = introspect_schema().expect("introspection must succeed");
+        let schema_json = crate::schema::forge_schema_json();
+        let info = introspect_schema(&schema_json).expect("introspection must succeed");
 
         assert_eq!(info.entity_types.len(), 2, "Expected User and Document");
 

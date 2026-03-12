@@ -168,10 +168,10 @@ fn commit_batch(engine: &StorageEngine, batch: &[WriteRequest]) -> Result<()> {
             .push((&req.id, &req.payload));
     }
 
-    // Since we're bridging across multiple collections potentially, and `insert_batch`
-    // runs ONE collection per transaction right now, we technically commit N transactions
-    // (where N = number of distinct collections hit in this 2ms window).
-    // In practice for a REST API, N is almost always 1.
+    // Currently: one transaction per distinct collection in the batch window.
+    // For a typical REST API this is N=1 almost always, so the cost is negligible.
+    // If you're hammering multiple collections simultaneously on a v0.4 cluster node,
+    // revisit this with a multi-table single-transaction path — flagged for v0.4.
     for (collection, docs) in by_collection {
         engine.insert_batch(collection, &docs, true)?;
     }

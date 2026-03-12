@@ -1,4 +1,8 @@
-//! ForgeDB — secure-by-default embedded document database.
+//! ForgeDB — the entrypoint binary that wires every crate together.
+//!
+//! Handles CLI parsing, config loading, TLS setup, storage opening, key loading,
+//! and launching the Axum server + optional TUI. Designed to be boring here so
+//! the actual interesting logic lives in the right crate.
 
 use std::path::PathBuf;
 
@@ -142,8 +146,17 @@ fn cmd_serve(config_path: PathBuf, with_tui: bool) -> forge_types::Result<()> {
             policy_path.display()
         ))
     })?;
-    let policy_engine = forge_query::policy::PolicyEngine::new(&policy_src)?;
-    let policy_engine = std::sync::Arc::new(policy_engine);
+
+    let schema_path = config.data_dir.join("schema.json");
+    let schema_src = std::fs::read_to_string(&schema_path).unwrap_or_else(|_| {
+        tracing::warn!("schema.json not found, falling back to built-in default schema");
+        serde_json::to_string(&forge_query::schema::forge_schema_json()).unwrap()
+    });
+    let schema_json: serde_json::Value = serde_json::from_str(&schema_src)
+        .map_err(|e| ForgeError::Config(format!("failed to parse schema.json: {e}")))?;
+
+    let policy_engine = forge_query::policy::PolicyEngine::new(&policy_src, schema_json)?;
+    let policy_engine = std::sync::Arc::new(tokio::sync::RwLock::new(policy_engine));
     tracing::info!("Cedar enforcement policies loaded successfully");
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -159,11 +172,18 @@ fn cmd_serve(config_path: PathBuf, with_tui: bool) -> forge_types::Result<()> {
             config.bind_address
         );
 
-        // Derive a 32-byte cursor signing key from the master password.
-        let cursor_key_hash =
-            aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, password.as_bytes());
+        // Derive a 32-byte cursor signing key using HKDF-SHA256 with a labeled salt.
+        // Using raw SHA256(password) as a key would have been fine functionally, but HKDF
+        // gives us proper domain separation — the cursor key is demonstrably distinct from
+        // any other key material derived from the same password. Easier to reason about.
+        let hkdf_salt =
+            aws_lc_rs::hkdf::Salt::new(aws_lc_rs::hkdf::HKDF_SHA256, b"forgedb-cursor-v1");
+        let prk = hkdf_salt.extract(password.as_bytes());
         let mut cursor_key = [0u8; 32];
-        cursor_key.copy_from_slice(cursor_key_hash.as_ref());
+        prk.expand(&[b"cursor-hmac"], aws_lc_rs::hkdf::HKDF_SHA256)
+            .expect("HKDF expand is infallible for valid output length")
+            .fill(&mut cursor_key)
+            .expect("32 bytes always fits HKDF_SHA256 OKM");
         let cursor_signer = std::sync::Arc::new(forge_security::CursorSigner::new(&cursor_key));
 
         let app_state = forge_server::AppState {
@@ -173,6 +193,8 @@ fn cmd_serve(config_path: PathBuf, with_tui: bool) -> forge_types::Result<()> {
             secret_key: secret_key.clone(),
             policy_engine: policy_engine.clone(),
             cursor_signer,
+            schema_path: config.data_dir.join("schema.json"),
+            policy_path: config.data_dir.join("policy.cedar"),
         };
         let app = forge_server::app(app_state);
 
@@ -213,18 +235,22 @@ fn cmd_serve(config_path: PathBuf, with_tui: bool) -> forge_types::Result<()> {
     })
 }
 
-/// Prompt for a password on stderr so it works even when stdout is piped.
-/// Falls back to reading from `FORGEDB_PASSWORD` env var for non-interactive use.
+/// Prompt for a password on stderr, with terminal echo suppressed.
+///
+/// Falls back to `FORGEDB_PASSWORD` env var first — useful for CI pipelines,
+/// Docker containers, or anyone who's typed the password twenty times today.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Config`] if the terminal I/O fails outright.
 fn prompt_password(prompt: &str) -> forge_types::Result<String> {
     // Check env var first for CI / non-interactive scenarios
     if let Ok(pw) = std::env::var("FORGEDB_PASSWORD") {
         return Ok(pw);
     }
 
-    eprint!("\x1b[1;36m{prompt}\x1b[0m");
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| ForgeError::Config(format!("failed to read password: {e}")))?;
-    Ok(input.trim().to_string())
+    // `rpassword::prompt_password` writes to the terminal and suppresses echo.
+    // No more accidentally leaking your DB password in a screen recording.
+    rpassword::prompt_password(format!("\x1b[1;36m{prompt}\x1b[0m"))
+        .map_err(|e| ForgeError::Config(format!("failed to read password: {e}")))
 }

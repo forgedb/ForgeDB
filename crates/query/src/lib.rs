@@ -1,8 +1,8 @@
-//! Query engine for ForgeDB (planned for full release in v0.3).
+//! Query engine for ForgeDB (Cedar RLS + join query, fully shipped in v0.3).
 //!
-//! Right now (v0.2.0), this crate is exclusively housing the Cedar RLS (Row-Level Security) policy
-//! engine. I want every single document access request routed through `PolicyEngine::check_permit`
-//! before it even thinks about touching the storage layer. No exceptions.
+//! This crate houses the Cedar RLS (Row-Level Security) policy engine and the
+//! join query planner. Every document access is routed through `PolicyEngine::check_permit`
+//! before it touches the storage layer. No exceptions, no bypasses.
 //!
 //! # Architecture
 //!

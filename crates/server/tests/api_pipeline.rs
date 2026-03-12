@@ -18,6 +18,37 @@ use forge_server::AppState;
 use forge_storage::{StorageEngine, spawn_writer};
 use tempfile::TempDir;
 
+fn get_test_schema() -> serde_json::Value {
+    let mut schema = forge_query::schema::forge_schema_json();
+    if let Some(ns) = schema.get_mut("ForgeDB").and_then(|ns| ns.as_object_mut()) {
+        if let Some(et) = ns.get_mut("entityTypes").and_then(|e| e.as_object_mut()) {
+            for c in ["Users", "Secrets", "Items", "_schema"] {
+                et.insert(
+                    c.to_string(),
+                    serde_json::json!({"shape": {"type": "Record", "attributes": {}}}),
+                );
+            }
+        }
+        if let Some(actions) = ns.get_mut("actions").and_then(|a| a.as_object_mut()) {
+            for action in ["Read", "Write", "Delete"] {
+                if let Some(rt) = actions
+                    .get_mut(action)
+                    .and_then(|a| a.as_object_mut())
+                    .and_then(|a| a.get_mut("appliesTo"))
+                    .and_then(|ap| ap.as_object_mut())
+                    .and_then(|ap| ap.get_mut("resourceTypes"))
+                    .and_then(|rt| rt.as_array_mut())
+                {
+                    for c in ["Users", "Secrets", "Items", "_schema"] {
+                        rt.push(serde_json::Value::String(c.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    schema
+}
+
 /// Spins up an in-memory ForgeDB test harness with a blanket permit policy.
 fn test_harness() -> (axum::Router, String, TempDir) {
     let tmp = TempDir::new().expect("tempdir creation");
@@ -35,8 +66,12 @@ fn test_harness() -> (axum::Router, String, TempDir) {
     let secret_key = Arc::new(kp.secret.clone());
 
     // Blanket permit — allows everything, which is what we want for happy-path tests.
-    let policy = PolicyEngine::new("permit(principal, action, resource);").expect("policy parse");
-    let policy_engine = Arc::new(policy);
+    let policy = PolicyEngine::new(
+        "permit(principal, action, resource);",
+        get_test_schema(),
+    )
+    .expect("policy parse");
+    let policy_engine = Arc::new(tokio::sync::RwLock::new(policy));
 
     let state = AppState {
         engine: engine.clone(),
@@ -45,6 +80,8 @@ fn test_harness() -> (axum::Router, String, TempDir) {
         secret_key,
         policy_engine,
         cursor_signer: std::sync::Arc::new(forge_security::CursorSigner::new(&[0u8; 32])),
+        schema_path: db_path.with_extension("schema"),
+        policy_path: db_path.with_extension("policy"),
     };
 
     // Issue a valid token for our test user
@@ -67,9 +104,9 @@ fn deny_harness() -> (axum::Router, String, TempDir) {
     let public_key = Arc::new(kp.public);
     let secret_key = Arc::new(kp.secret.clone());
 
-    // Empty policy set  → deny by default. No permits, no access.
-    let policy = PolicyEngine::new("").expect("empty policy");
-    let policy_engine = Arc::new(policy);
+    let policy =
+        PolicyEngine::new("", get_test_schema()).expect("empty policy");
+    let policy_engine = Arc::new(tokio::sync::RwLock::new(policy));
 
     let state = AppState {
         engine: engine.clone(),
@@ -78,6 +115,8 @@ fn deny_harness() -> (axum::Router, String, TempDir) {
         secret_key,
         policy_engine,
         cursor_signer: std::sync::Arc::new(forge_security::CursorSigner::new(&[0u8; 32])),
+        schema_path: db_path.with_extension("schema"),
+        policy_path: db_path.with_extension("policy"),
     };
 
     let claims = TokenClaims::new("denied-user", 3600, None);
@@ -328,4 +367,66 @@ async fn patch_document() {
         doc.get("name").is_none(),
         "name should be deleted (null merge semantics)"
     );
+}
+
+#[tokio::test]
+async fn test_dynamic_schema_patching() {
+    let (app, token, _tmp) = test_harness();
+
+    // 1. Try to POST to `invoices` - should fail with 403 because it's unregistered
+    let post_req = Request::builder()
+        .method("POST")
+        .uri("/v1/invoices")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"amount": 100}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(post_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // 2. Fetch the current schema
+    let get_schema_req = Request::builder()
+        .uri("/_/schema?raw=true")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.clone().oneshot(get_schema_req).await.unwrap();
+    let schema_bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let mut schema: serde_json::Value = serde_json::from_slice(&schema_bytes).unwrap();
+
+    // 3. Patch the schema to add `Invoices`
+    schema["ForgeDB"]["entityTypes"]["Invoices"] = serde_json::json!({
+        "shape": { "type": "Record", "attributes": {} }
+    });
+    for action in ["Read", "Write", "Delete"] {
+        schema["ForgeDB"]["actions"][action]["appliesTo"]["resourceTypes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::Value::String("Invoices".into()));
+    }
+
+    // 4. PUT the updated schema
+    let put_schema_req = Request::builder()
+        .method("PUT")
+        .uri("/_/schema")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&schema).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(put_schema_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 5. POST to `invoices` again - should now succeed
+    let post_req = Request::builder()
+        .method("POST")
+        .uri("/v1/invoices")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "application/json") // force json
+        .body(Body::from(r#"{"amount": 100}"#))
+        .unwrap();
+    
+    let resp = app.oneshot(post_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }

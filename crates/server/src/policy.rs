@@ -54,11 +54,16 @@ pub async fn require_policy(
 
     let auth_ctx = AuthContext::new(principal, action, &resource);
 
-    match state.policy_engine.check_permit(&auth_ctx) {
+    let is_permitted = {
+        let pe_guard = state.policy_engine.read().await;
+        pe_guard.check_permit(&auth_ctx).map_err(|e| e.to_string())
+    };
+
+    match is_permitted {
         Ok(_) => Ok(next.run(req).await),
         Err(e) => {
-            tracing::warn!("access denied by Cedar policy: {e}");
-            Err((StatusCode::FORBIDDEN, "Access Denied").into_response())
+            tracing::warn!("access denied: {}, principal: {}", e, principal);
+            Err((StatusCode::FORBIDDEN, "Forbidden").into_response())
         }
     }
 }
