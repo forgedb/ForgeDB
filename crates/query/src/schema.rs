@@ -68,7 +68,7 @@ pub fn forge_schema_json() -> serde_json::Value {
     })
 }
 
-/// Spits out the compiled Cedar schema for ForgeDB.
+/// Spits out a compiled Cedar schema for ForgeDB from a parsed JSON value.
 ///
 /// This dictates exactly what entity types, actions, and context shapes are actually legal
 /// in the system. Any user policy that tries to invent an action (e.g., `permit(principal, action == Action::"Hack", resource)`)
@@ -76,11 +76,10 @@ pub fn forge_schema_json() -> serde_json::Value {
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::Policy`] if our hardcoded JSON schema somehow
-/// turns out to be invalid. Honestly, that should only ever happen during dev when someone typos a brace.
-pub fn forge_schema() -> Result<Schema> {
-    Schema::from_json_value(forge_schema_json())
-        .map_err(|e| ForgeError::Policy(format!("failed to parse built-in Cedar schema: {e}")))
+/// Returns [`ForgeError::Policy`] if the provided JSON schema is invalid.
+pub fn parse_schema(json_val: serde_json::Value) -> Result<Schema> {
+    Schema::from_json_value(json_val)
+        .map_err(|e| ForgeError::Policy(format!("failed to parse Cedar schema: {e}")))
 }
 
 #[cfg(test)]
@@ -89,7 +88,8 @@ mod tests {
 
     #[test]
     fn schema_compiles_successfully() {
-        let schema = forge_schema().expect("hardcoded schema must be entirely valid");
+        let schema =
+            parse_schema(forge_schema_json()).expect("hardcoded schema must be entirely valid");
 
         let ns = schema
             .action_entities()

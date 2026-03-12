@@ -1,6 +1,6 @@
 [package]
 name = "forge-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,6 +11,7 @@ forge-types = { workspace = true }
 forge-security = { workspace = true }
 forge-storage = { workspace = true }
 forge-auth = { workspace = true }
+forge-query = { workspace = true }
 tracing = { workspace = true }
 toml = { workspace = true }
 crossterm = "0.29.0"

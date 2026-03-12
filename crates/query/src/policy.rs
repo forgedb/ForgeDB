@@ -18,7 +18,7 @@ use cedar_policy::{Authorizer, Decision, Entities, PolicySet, Schema};
 use forge_types::{ForgeError, Result};
 
 use crate::context::AuthContext;
-use crate::schema::forge_schema;
+use crate::schema::parse_schema;
 
 /// The uncompromising authorization layer for document access.
 ///
@@ -30,6 +30,8 @@ pub struct PolicyEngine {
     policies: PolicySet,
     #[allow(dead_code)]
     schema: Schema,
+    pub raw_schema: serde_json::Value,
+    pub cedar_src: String,
 }
 
 impl std::fmt::Debug for PolicyEngine {
@@ -50,12 +52,12 @@ impl PolicyEngine {
     /// # Errors
     ///
     /// Returns [`ForgeError::Policy`] if parsing or schema validation goes sideways.
-    pub fn new(cedar_src: &str) -> Result<Self> {
+    pub fn new(cedar_src: &str, schema_json: serde_json::Value) -> Result<Self> {
         let policies: PolicySet = cedar_src
             .parse()
             .map_err(|e| ForgeError::Policy(format!("syntax error in policy: {e}")))?;
 
-        let schema = forge_schema()?;
+        let schema = parse_schema(schema_json.clone())?;
 
         // Mandatory Validation: catch bugs like typos and type mismatches early.
         let validator = cedar_policy::Validator::new(schema.clone());
@@ -72,6 +74,8 @@ impl PolicyEngine {
             authorizer: Authorizer::new(),
             policies,
             schema,
+            raw_schema: schema_json,
+            cedar_src: cedar_src.to_string(),
         })
     }
 
@@ -93,7 +97,7 @@ impl PolicyEngine {
     /// Returns [`ForgeError::Policy`] when access is explicitly denied, or if
     /// the given context simply fails to build into a structurally valid Cedar request.
     pub fn check_permit(&self, ctx: &AuthContext) -> Result<()> {
-        let request = ctx.to_cedar_request()?;
+        let request = ctx.to_cedar_request(Some(&self.schema))?;
 
         // We aren't fully materializing massive entity trees (e.g., User -> Group -> Organization)
         // just yet. So, we pass a totally empty Entities array. The principal/action/resource
@@ -129,12 +133,12 @@ mod tests {
             permit(
                 principal == ForgeDB::User::"alice",
                 action == ForgeDB::Action::"Read",
-                resource == ForgeDB::Document::"docs/1"
+                resource == ForgeDB::Document::"document/1"
             );
         "#;
 
-        let engine = PolicyEngine::new(src).unwrap();
-        let ctx = AuthContext::new("alice", "Read", "docs/1");
+        let engine = PolicyEngine::new(src, crate::schema::forge_schema_json()).unwrap();
+        let ctx = AuthContext::new("alice", "Read", "document/1");
 
         assert!(
             engine.check_permit(&ctx).is_ok(),
@@ -158,22 +162,22 @@ mod tests {
             );
         "#;
 
-        let engine = PolicyEngine::new(src).unwrap();
+        let engine = PolicyEngine::new(src, crate::schema::forge_schema_json()).unwrap();
 
         // Alice easily matches the blanket permit policy, and importantly, she isn't forbidden.
-        let ctx_alice = AuthContext::new("alice", "Read", "docs/1");
+        let ctx_alice = AuthContext::new("alice", "Read", "document/1");
         assert!(engine.check_permit(&ctx_alice).is_ok());
 
         // Eve happens to match the permit too, but ALSO matches the forbid policy. Forbid always wins. Always.
-        let ctx_eve = AuthContext::new("eve", "Read", "docs/1");
+        let ctx_eve = AuthContext::new("eve", "Read", "document/1");
         let err = engine.check_permit(&ctx_eve).unwrap_err();
         assert!(format!("{err}").contains("denied"));
     }
 
     #[test]
     fn empty_policy_denies_by_default() {
-        let engine = PolicyEngine::new("").unwrap();
-        let ctx = AuthContext::new("alice", "Read", "docs/1");
+        let engine = PolicyEngine::new("", crate::schema::forge_schema_json()).unwrap();
+        let ctx = AuthContext::new("alice", "Read", "document/1");
         let err = engine.check_permit(&ctx).unwrap_err();
         assert!(format!("{err}").contains("denied"));
     }
@@ -181,7 +185,7 @@ mod tests {
     #[test]
     fn invalid_syntax_caught_at_construction() {
         let src = r#"permit( principal = "whoops" )"#; // = instead of ==
-        assert!(PolicyEngine::new(src).is_err());
+        assert!(PolicyEngine::new(src, crate::schema::forge_schema_json()).is_err());
     }
 
     #[test]
@@ -191,7 +195,7 @@ mod tests {
             permit(principal, action, resource)
             when { resource.ownerrr == "alice" };
         "#;
-        let err = PolicyEngine::new(src).unwrap_err();
+        let err = PolicyEngine::new(src, crate::schema::forge_schema_json()).unwrap_err();
         assert!(err.to_string().contains("validation failed"));
         assert!(err.to_string().contains("ownerrr"));
     }
