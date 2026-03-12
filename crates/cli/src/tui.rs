@@ -297,7 +297,8 @@ impl App {
             let col = &self.collections[i];
             // Explicitly ask for JSON — without this header, the server defaults
             // to application/msgpack, which reqwest's .json() can't decode.
-            let req = self.client
+            let req = self
+                .client
                 .get(format!("{}/v1/{}?limit=50", self.url, col))
                 .header(reqwest::header::ACCEPT, "application/json");
             let req = if let Some(t) = &self.bearer_token {
@@ -311,7 +312,11 @@ impl App {
                     if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
                         self.docs = data.clone();
                         // Reset doc selection if we switched collections or the index is now out of range.
-                        if self.docs_state.selected().is_none_or(|s| s >= self.docs.len()) {
+                        if self
+                            .docs_state
+                            .selected()
+                            .is_none_or(|s| s >= self.docs.len())
+                        {
                             self.docs_state.select(if !self.docs.is_empty() {
                                 Some(0)
                             } else {
@@ -406,13 +411,16 @@ impl App {
                             modified = true;
                         }
 
-                        if let Some(actions) =
-                            ns.get_mut("actions").and_then(|a| a.as_object_mut())
+                        if let Some(actions) = ns.get_mut("actions").and_then(|a| a.as_object_mut())
                         {
                             for action in ["Read", "Write", "Delete"] {
-                                if let Some(act) = actions.get_mut(action).and_then(|a| a.as_object_mut())
-                                    && let Some(applies) = act.get_mut("appliesTo").and_then(|ap| ap.as_object_mut())
-                                    && let Some(rt) = applies.get_mut("resourceTypes").and_then(|r| r.as_array_mut())
+                                if let Some(act) =
+                                    actions.get_mut(action).and_then(|a| a.as_object_mut())
+                                    && let Some(applies) =
+                                        act.get_mut("appliesTo").and_then(|ap| ap.as_object_mut())
+                                    && let Some(rt) = applies
+                                        .get_mut("resourceTypes")
+                                        .and_then(|r| r.as_array_mut())
                                 {
                                     let val = serde_json::Value::String(coll_name_cap.clone());
                                     if !rt.contains(&val) {
@@ -825,19 +833,20 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> io::R
                             app.screen = AppScreen::NewUser;
                         }
                         KeyCode::Char('e') => {
-                            // Gotta make sure we actually have a document and a collection selected.
-                            // It's a bit defensive, sure, but I've seen too many TUIs blow up because
-                            // they assumed state that wasn't there. Trust but verify.
                             if let (Some(i), Some(col_idx)) =
                                 (app.docs_state.selected(), app.collections_state.selected())
-                                && let Some(doc) = app.docs.get(i)
+                                && let Some(wrapper) = app.docs.get(i)
                             {
-                                let id = doc
+                                let id = wrapper
                                     .get("id")
                                     .and_then(|v| v.as_str())
                                     .map(|s| s.to_string());
                                 let col = app.collections[col_idx].clone();
-                                let buf = serde_json::to_string_pretty(doc).unwrap_or_default();
+                                // Server returns {id, doc} wrappers — edit only the inner object.
+                                // Showing the wrapper confused users and caused redundant id fields
+                                // on re-save. Fall back to the full wrapper if doc is missing.
+                                let inner = wrapper.get("doc").unwrap_or(wrapper);
+                                let buf = serde_json::to_string_pretty(inner).unwrap_or_default();
 
                                 app.editor = Some(EditorState {
                                     buffer: buf,
